@@ -1,0 +1,162 @@
+#
+# Dataset source configuration for h3-loop-modeling training (64 decoys)
+# ─────────────────────────────────────────────────────────────────────
+# All path templates support {db_root} and {pdb} placeholders.
+#
+# When this YAML is passed via --dataset_config, the training pipeline
+# uses it exclusively for dataset control (list paths, sources, filters).
+# Hardcoded paths in data_module.py are skipped entirely.
+#
+
+db_root: /home/sujin/DB/h3-loop-modeling
+cache_root: /home/sujin/DB/h3-loop-modeling/ab_ag/1_tr_abag_prep/_graph_cache
+seed: 42
+n_decoy: 64                      # total decoys returned per target
+min_diversity_threshold: 2       # min #sources to trigger 1-each diversity fill
+
+# ── Training / validation list paths ──
+# When train_list_from_pkl is set, train list is loaded from that info.pkl (e.g. 1_tr_abag)
+# so that targets match the DB (xtal etc.). Otherwise train_list file is used.
+train_list_from_pkl: /home/sujin/DB/h3-loop-modeling/ab_ag/1_tr_abag/0_info/train.pkl
+train_list_pkl_key: list
+# train_list: /home/sujin/projects/h3-loop-modeling/data/list/0_FINAL/abag/train_95.list  # fallback when train_list_from_pkl not set
+valid_list_from_pkl: /home/sujin/DB/h3-loop-modeling/ab_ag/1_tr_abag/0_info/valid.pkl
+valid_list_pkl_key: list
+gp_list: /home/sujin/projects/h3-loop-modeling/data/list/0_FINAL/gp/train_val.list
+
+# ── Per-epoch random sampling counts ──
+# How many targets to sample per epoch from each list.
+# "all" or null (or omit) = use the full list without subsampling.
+num_gp: 0
+num_abag: 1000
+num_valid_abag: all   # validation targets per epoch (omit or "all" = full valid pool, 201)
+
+# ── RMSD range pre-filter ──
+# Applied per-source BEFORE mixing / graph loading.
+# Decoys outside [min_rmsd, max_rmsd] are excluded; their graph pickles
+# may never be loaded, saving memory.
+rmsd_filter:
+  min_rmsd: 0.0
+  max_rmsd: 30.0
+
+# ── PDB ID mapping ──
+# Old PDB IDs (in train list / FALC / pertMD paths) differ from new PDB IDs
+# (used by Boltz2, ComMat, Xtal).  This pickle provides the bidirectional map.
+pdb_id_mapping: /home/sujin/DB/h3-loop-modeling/ab_ag/1_tr_abag/0_info/info.pkl
+
+# ── graph_build args (forwarded to generate_graphs_from_target) ──
+graph_build:
+  dist_cutoff_center: 10.0
+  random_range: 1.5
+  max_neighbors: 60
+  use_all_atom: false
+  h3_range: [95, 102]
+  on_the_fly: true   # when true, skip caching for target_model_pickle sources
+                     # so that random_range augmentation is applied fresh each call
+
+# ── schedulable global knobs ──
+xtal_gate_prob: 0.5              # or use schedule below
+# xtal_gate_prob:
+#   schedule:
+#     - { epoch: 1,  value: 0.0 }
+#     - { epoch: 20, value: 0.5 }
+#     - { epoch: 50, value: 1.0 }
+#   interpolation: linear
+
+# boltz2_ag_local_rmsd_cutoff: disabled (Boltz2 decoys are not filtered by ag_local_rmsd)
+# boltz2_ag_local_rmsd_cutoff: 2.0
+#   schedule:
+#     - { epoch: 1,  value: 1.5 }
+#     - { epoch: 50, value: 2.5 }
+#   interpolation: step
+
+# ── sources ──
+# NOTE: FALC / pertMD paths match the old hardcoded DB_final_train paths.
+#       ComMat / Boltz2 / Xtal use 1_tr_abag_prep (original YAML paths).
+sources:
+  # 1) FALC : graph pickle (disabled for lDDT-tier DPO finetune)
+  ABAG_FP:
+    enabled: false
+    file_type: graph_pickle
+    weight: 3.0
+    per_target_cap: 1032
+    max_fraction: 0.6
+    pdb_id_type: old
+    graph_template: "{db_root}/ab_ag/DB_final_train/graph/se3/{pdb}.dat"
+    rmsd_template:  "{db_root}/ab_ag/DB_final_train/decoy/{pdb}/{pdb}_fp.rmsd"
+
+  # 2) pertMD t500 : graph pickle (disabled)
+  pertMD_t500:
+    enabled: false
+    file_type: graph_pickle
+    weight: 2.0
+    per_target_cap: 300
+    max_fraction: 0.4
+    pdb_id_type: old
+    graph_template: "{db_root}/ab_ag/DB_final_train/graph/pertMD_t500_c300/{pdb}.dat"
+    rmsd_template:  "{db_root}/ab_ag/DB_final_train/decoy/{pdb}/pertmd_t500_c300/{pdb}_p.rmsd"
+
+  # 3) pertMD t3000 : graph pickle (disabled)
+  pertMD_t3000:
+    enabled: false
+    file_type: graph_pickle
+    weight: 1.5
+    per_target_cap: 300
+    max_fraction: 0.3
+    pdb_id_type: old
+    graph_template: "{db_root}/ab_ag/DB_final_train/graph/pertMD_t3000_c300/{pdb}.dat"
+    rmsd_template:  "{db_root}/ab_ag/DB_final_train/decoy/{pdb}/pertmd_t3000_c300/{pdb}_p.rmsd"
+
+  # 4) pertMD t3000 256 : graph pickle (disabled)
+  pertMD_t3000_256:
+    enabled: false
+    file_type: graph_pickle
+    weight: 1.0
+    per_target_cap: 256
+    max_fraction: 0.3
+    pdb_id_type: old
+    graph_template: "{db_root}/ab_ag/DB_final_train/graph/pertMD_t3000_c300_256/{pdb}.dat"
+    rmsd_template:  "{db_root}/ab_ag/DB_final_train/decoy/{pdb}/pertmd_t3000_c300_256/{pdb}_p.rmsd"
+
+  # 5) ComMat : target_model_pickle
+  ComMat:
+    enabled: true
+    file_type: target_model_pickle
+    weight: 1.0
+    per_target_cap: 32
+    max_fraction: 0.2
+    pdb_id_type: new
+    target_pickle_template: "{db_root}/ab_ag/1_tr_abag_prep/2_commat/{pdb}.pkl"
+
+  # 6) Boltz2 : target_model_pickle (converted & cached)
+  Boltz2:
+    enabled: true
+    file_type: target_model_pickle
+    weight: 2.0
+    per_target_cap: 50
+    max_fraction: 0.4
+    pdb_id_type: new
+    target_pickle_template: "{db_root}/ab_ag/1_tr_abag_prep/1_boltz2/{pdb}.pkl"
+    metrics_template: "{db_root}/ab_ag/1_tr_abag_prep/1_boltz2/{pdb}.pkl"
+    metrics_format: pkl          # use Target.models[i].ag_local_rmsd
+
+  # 7) Xtal : target_model_pickle (gated per-target)
+  Xtal:
+    enabled: true
+    file_type: target_model_pickle
+    weight: 1.0
+    per_target_cap: 1
+    max_fraction: 0.05
+    pdb_id_type: new
+    target_pickle_template: "{db_root}/ab_ag/1_tr_abag_prep/0_xtal/{pdb}.pkl"
+
+  # 8) GP_FALC : graph pickle for general-protein targets (disabled)
+  GP_FP:
+    enabled: false
+    file_type: graph_pickle
+    weight: 3.0
+    per_target_cap: 1032
+    max_fraction: 0.6
+    pdb_id_type: old
+    graph_template: "{db_root}/general_protein/graph/se3/{pdb}.dat"
+    rmsd_template:  "{db_root}/general_protein/decoy/{pdb}/{pdb}_fp.rmsd"
