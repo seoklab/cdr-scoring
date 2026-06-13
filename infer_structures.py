@@ -33,6 +33,9 @@ from model.fiber import Fiber  # noqa: E402
 from model.transformer import Sujin_with_SE3, Sujin_with_SE3_allatom  # noqa: E402
 
 
+CDR_NAMES = ("H1", "H2", "H3", "L1", "L2", "L3")
+
+
 DEFAULT_INPUT_DIR = (
     "/home/sujin/DB/h3-loop-modeling/ab_ag/"
     "3_h3_benchmark_after210930/22_af3/7b5g_H_X_A"
@@ -153,6 +156,8 @@ def write_csv(path, rows):
         "loop_lddt",
         "irmsd",
         "lrmsd",
+        *[f"{cdr}_loop_rmsd" for cdr in CDR_NAMES],
+        *[f"{cdr}_loop_lddt" for cdr in CDR_NAMES],
         "n_nodes",
         "n_edges",
         "path",
@@ -335,6 +340,22 @@ def main():
                         "loop_lddt": float("nan") if loop_metrics is None else loop_metrics.loop_lddt,
                         "irmsd": float("nan") if dock_metrics is None else dock_metrics.irmsd,
                         "lrmsd": float("nan") if dock_metrics is None else dock_metrics.lrmsd,
+                        **{
+                            f"{cdr}_loop_rmsd": (
+                                float("nan")
+                                if loop_metrics is None
+                                else loop_metrics.per_cdr_rmsd.get(cdr, float("nan"))
+                            )
+                            for cdr in CDR_NAMES
+                        },
+                        **{
+                            f"{cdr}_loop_lddt": (
+                                float("nan")
+                                if loop_metrics is None
+                                else loop_metrics.per_cdr_lddt.get(cdr, float("nan"))
+                            )
+                            for cdr in CDR_NAMES
+                        },
                         "n_nodes": meta["n_nodes"],
                         "n_edges": meta["n_edges"],
                         "path": meta["path"],

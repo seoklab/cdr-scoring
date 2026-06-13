@@ -307,13 +307,16 @@ def _apply_cdr_mask(dic: dict, cdr_ranges: Sequence[CDRRange]) -> None:
     chain_ids = dic["chain_id"]
     res_no = dic["res_no"]
     mask = torch.zeros_like(dic["ulr_mask"], dtype=torch.int64)
+    loop_id = torch.zeros_like(dic["ulr_mask"], dtype=torch.int64)
     for i, (chain_idx, resnum) in enumerate(zip(chain_ids.tolist(), res_no.tolist())):
         chain_id = REF_CHAIN[int(chain_idx)]
-        for range_chain, start, end in cdr_ranges:
+        for loop_idx, (range_chain, start, end) in enumerate(cdr_ranges, start=1):
             if chain_id == range_chain and start <= int(resnum) <= end:
                 mask[i] = 1
+                loop_id[i] = loop_idx
                 break
     dic["ulr_mask"] = mask
+    dic["loop_id"] = loop_id
 
 
 class OnTheFlyStructureGraphDataset(Dataset):

@@ -102,6 +102,10 @@ class GraphBuildArgs:
     max_neighbors: int = 60           # 0 means disabled (radius-only)
     use_all_atom: bool = False
     h3_range: List[int] = field(default_factory=lambda: [95, 102])
+    cdr_ranges: Dict[str, List[List[int]]] = field(default_factory=lambda: {
+        "H": [[26, 32], [52, 56], [95, 102]],
+        "L": [[24, 34], [50, 56], [89, 97]],
+    })
     on_the_fly: bool = True             # skip caching for target_model_pickle (preserves random_range)
 
 
@@ -151,6 +155,9 @@ class DatasetSpec:
     cache_root: str = ""
     seed: int = 42
     n_decoy: int = 64                   # total decoys per target returned to model
+    task_scope: str = "full_cdr"        # "full_cdr" (M0) or legacy "h3"
+    label_metric: str = "loop_rmsd"     # main scalar target; lower-is-better losses expect RMSD
+    ranking_metric: str = "loop_rmsd"   # metric used for filtering/tier sampling
     min_diversity_threshold: int = 3     # min available sources to trigger diversity fill
     graph_build: GraphBuildArgs = field(default_factory=GraphBuildArgs)
     sources: Dict[str, SourceSpec] = field(default_factory=dict)
@@ -214,6 +221,10 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
         max_neighbors=gb_raw.get("max_neighbors", 60),
         use_all_atom=gb_raw.get("use_all_atom", False),
         h3_range=gb_raw.get("h3_range", [95, 102]),
+        cdr_ranges=gb_raw.get("cdr_ranges", {
+            "H": [[26, 32], [52, 56], [95, 102]],
+            "L": [[24, 34], [50, 56], [89, 97]],
+        }),
         on_the_fly=gb_raw.get("on_the_fly", False),
     )
 
@@ -261,6 +272,9 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
         cache_root=raw.get("cache_root", ""),
         seed=raw.get("seed", 42),
         n_decoy=raw.get("n_decoy", 64),
+        task_scope=raw.get("task_scope", "full_cdr"),
+        label_metric=raw.get("label_metric", "loop_rmsd"),
+        ranking_metric=raw.get("ranking_metric", "loop_rmsd"),
         min_diversity_threshold=raw.get("min_diversity_threshold", 3),
         graph_build=graph_build,
         sources=sources,

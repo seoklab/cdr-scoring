@@ -44,6 +44,9 @@ def convert_and_cache(
     max_neighbors: int = 0,
     use_all_atom: bool = False,
     h3_range: Tuple[int, int] = (95, 102),
+    cdr_ranges=None,
+    task_scope: str = "full_cdr",
+    label_metric: str = "loop_rmsd",
 ) -> Tuple[Optional[str], Optional[str]]:
     """Load a Target pickle, generate graphs, and write cache.
 
@@ -72,13 +75,16 @@ def convert_and_cache(
 
             target = _load_target_pickle(target_pickle_path)
 
-            graphs, rmsds, ranks = generate_graphs_from_target(
+            graphs, rmsds, _ranks, _decoy_meta = generate_graphs_from_target(
                 target,
                 dist_cutoff_center=dist_cutoff_center,
                 random_range=random_range,
                 max_neighbors=max_neighbors,
                 use_all_atom=use_all_atom,
                 h3_range=tuple(h3_range),
+                cdr_ranges=cdr_ranges,
+                task_scope=task_scope,
+                label_metric=label_metric,
             )
 
             if not graphs:

@@ -7,6 +7,7 @@ from data_loading.graph_generation_from_target import (
     build_edge_mask,
     build_graph,
     decoy_identity_from_model,
+    _get_model_metric,
 )
 from runtime.utils import get_local_rank
 from runtime.arguments import PARSER
@@ -83,6 +84,21 @@ def _load_graph_pickle(path: str):
     """Load a graph-list pickle saved with an older DGL version."""
     with open(path, "rb") as f:
         return _GraphPickleUnpickler(f).load()
+
+
+def _model_loop_label(model, spec=None):
+    task_scope = getattr(spec, "task_scope", "full_cdr") if spec is not None else "full_cdr"
+    label_metric = getattr(spec, "label_metric", "loop_rmsd") if spec is not None else "loop_rmsd"
+    value = _get_model_metric(model, label_metric, task_scope=task_scope)
+    if torch.isfinite(torch.tensor(value)):
+        return value
+    if task_scope == "h3":
+        return _get_model_metric(model, "h3_rmsd", task_scope="h3")
+    return float("nan")
+
+
+def _graph_build_cdr_ranges(gb):
+    return getattr(gb, "cdr_ranges", None)
 
 # ── Lazy imports for YAML-driven pipeline (avoid import errors when not used) ──
 _dataset_pkg_loaded = False
@@ -573,8 +589,12 @@ class MyDataset(Dataset):
                     cand.target_model_path, cache_root, sname, pdb_id,
                     dist_cutoff_center=gb.dist_cutoff_center,
                     random_range=gb.random_range,
+                    max_neighbors=gb.max_neighbors,
                     use_all_atom=gb.use_all_atom,
                     h3_range=tuple(gb.h3_range),
+                    cdr_ranges=_graph_build_cdr_ranges(gb),
+                    task_scope=spec.task_scope,
+                    label_metric=spec.label_metric,
                 )
                 if gp is None:
                     continue
@@ -709,7 +729,7 @@ class MyDataset(Dataset):
                     # defer graph generation to Phase 3.
                     try:
                         target_obj = _load_target_pickle(cand.target_model_path)
-                        all_rmsds = [m.h3_rmsd for m in target_obj.models]
+                        all_rmsds = [_model_loop_label(m, spec) for m in target_obj.models]
                         ag_local_full = [_ag_local_from_model(m) for m in target_obj.models]
                         target_pickle_path = cand.target_model_path
                         graph_path = None
@@ -731,6 +751,9 @@ class MyDataset(Dataset):
                         max_neighbors=gb.max_neighbors,
                         use_all_atom=gb.use_all_atom,
                         h3_range=tuple(gb.h3_range),
+                        cdr_ranges=_graph_build_cdr_ranges(gb),
+                        task_scope=spec.task_scope,
+                        label_metric=spec.label_metric,
                     )
                     if gp is None:
                         continue
@@ -894,6 +917,8 @@ class MyDataset(Dataset):
                                 model,
                                 use_all_atom=gb.use_all_atom,
                                 h3_range=tuple(gb.h3_range),
+                                cdr_ranges=_graph_build_cdr_ranges(gb),
+                                task_scope=spec.task_scope,
                             )
                             dist_cutoff = gb.dist_cutoff_center
                             if not inference_yaml and gb.random_range > 0:
@@ -1011,6 +1036,23 @@ class MyDataset(Dataset):
         del merged_graphs
         rmsd_tensor = torch.tensor(merged_rmsds, dtype=torch.float32)
         del merged_rmsds
+        finite_labels = rmsd_tensor[torch.isfinite(rmsd_tensor)]
+        ulr_count = int(graph_set.ndata["ulr"].sum().item()) if "ulr" in graph_set.ndata else 0
+        if ulr_count == 0:
+            _logging.warning("_getitem_yaml: %s has zero CDR/ULR nodes in batched graph", pdb_id)
+        if finite_labels.numel() > 0:
+            _logging.info(
+                "_getitem_yaml: %s label_metric=%s task_scope=%s n=%d min=%.3f max=%.3f ulr_nodes=%d",
+                pdb_id,
+                getattr(spec, "label_metric", "loop_rmsd"),
+                getattr(spec, "task_scope", "full_cdr"),
+                int(finite_labels.numel()),
+                float(finite_labels.min().item()),
+                float(finite_labels.max().item()),
+                ulr_count,
+            )
+        else:
+            _logging.warning("_getitem_yaml: %s has no finite loop labels", pdb_id)
 
         if inference_yaml:
             ag_local_tensor = torch.tensor(merged_ag_local, dtype=torch.float32)
@@ -1069,7 +1111,7 @@ class MyDataset(Dataset):
                 if exists:
                     try:
                         target_obj = _load_target_pickle(cand.target_model_path)
-                        all_rmsds = [m.h3_rmsd for m in target_obj.models]
+                        all_rmsds = [_model_loop_label(m, spec) for m in target_obj.models]
                         del target_obj
                     except Exception:
                         pass

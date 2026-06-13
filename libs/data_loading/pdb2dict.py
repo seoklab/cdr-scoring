@@ -13,6 +13,8 @@ from Bio.PDB.Atom import Atom
 from Bio.SVDSuperimposer import SVDSuperimposer
 from tqdm import tqdm
 
+from evaluation.loop_metrics import compute_loop_metrics_from_structures
+
 
 class ParsingRule(TypedDict, total=False):
     rank_pattern: str
@@ -94,6 +96,8 @@ class Model:
     pdb_path: Path
     full_rmsd: float = -1.0
     h3_rmsd: float = -1.0
+    loop_rmsd: float = float("nan")
+    loop_lddt: float = float("nan")
     ag_rmsd: float = -1.0
     ag_local_rmsd: float = -1.0
     h3_lddt: float = float("nan")
@@ -529,6 +533,17 @@ class Target:
                 model, atom_type=atom_type, region="Ab-H3"
             )
             model.h3_rmsd = target.rmsd(ab_align_gt, ab_align_md, h3_gt, h3_md)
+            try:
+                loop_metrics = compute_loop_metrics_from_structures(
+                    target.gt_structure,
+                    model.md_structure,
+                    rmsd_atom_type="backbone",
+                )
+                model.loop_rmsd = loop_metrics.loop_rmsd
+                model.loop_lddt = loop_metrics.loop_lddt
+            except Exception:
+                model.loop_rmsd = float("nan")
+                model.loop_lddt = float("nan")
 
             ab_align_gt, ab_align_md, ag_gt, ag_md = target.match_common_atoms(
                 model, atom_type=atom_type, region="Ag"
@@ -703,6 +718,8 @@ def main():
                 'ranking_score': model.ranking_score,
                 'full_rmsd': model.full_rmsd,
                 'h3_rmsd': model.h3_rmsd,
+                'loop_rmsd': model.loop_rmsd,
+                'loop_lddt': model.loop_lddt,
                 'ag_rmsd': model.ag_rmsd,
                 'ag_local_rmsd': model.ag_local_rmsd,
             }
@@ -724,6 +741,8 @@ def main():
                     f"Model (ranking: {model.ranking}) "
                     f"Full RMSD: {model.full_rmsd:.4f}, "
                     f"H3 RMSD: {model.h3_rmsd:.4f}, "
+                    f"Loop RMSD: {model.loop_rmsd:.4f}, "
+                    f"Loop lDDT: {model.loop_lddt:.4f}, "
                     f"Ag RMSD: {model.ag_rmsd:.4f}, "
                     f"Ag Local RMSD: {model.ag_local_rmsd:.4f}"
                 )

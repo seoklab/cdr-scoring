@@ -1,0 +1,16 @@
+nohup: ignoring input
+data rows: 18,500
+selected rows: 18,500 mode=all
+cached rows: 3,459
+missing rows: 15,041 across 185 targets
+metrics: all; max_workers: 12
+completed 5/185 targets; 405/15,041 new rows; elapsed=312.9s
+completed 10/185 targets; 807/15,041 new rows; elapsed=516.7s
+completed 15/185 targets; 1,212/15,041 new rows; elapsed=640.6s
+completed 20/185 targets; 1,621/15,041 new rows; elapsed=915.8s
+completed 25/185 targets; 2,025/15,041 new rows; elapsed=1232.8s
+completed 30/185 targets; 2,435/15,041 new rows; elapsed=1278.3s
+completed 35/185 targets; 2,841/15,041 new rows; elapsed=1431.9s
+completed 40/185 targets; 3,251/15,041 new rows; elapsed=1739.0s
+completed 45/185 targets; 3,658/15,041 new rows; elapsed=1891.6s
+completed 50/185 targets; 4,059/15,041 new rows; elapsed=1974.8s

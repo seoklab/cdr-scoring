@@ -6,6 +6,85 @@ from data_loading import coords_rosetta6d
 from .constants import MAX_REL_INDEX, AA3_IDX, restype_name_to_atom14_names, MAX_NUM_ATOM, REF_CHAIN
 import random
 import re
+import logging
+
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_CDR_RANGES = {
+    "H": ((26, 32), (52, 56), (95, 102)),
+    "L": ((24, 34), (50, 56), (89, 97)),
+}
+
+CDR_LOOP_IDS = {
+    ("H", 26, 32): 1,
+    ("H", 52, 56): 2,
+    ("H", 95, 102): 3,
+    ("L", 24, 34): 4,
+    ("L", 50, 56): 5,
+    ("L", 89, 97): 6,
+}
+
+
+def _normalize_cdr_ranges(cdr_ranges):
+    if cdr_ranges is None:
+        return None
+    if isinstance(cdr_ranges, dict):
+        return {
+            str(chain_id): tuple((int(start), int(end)) for start, end in ranges)
+            for chain_id, ranges in cdr_ranges.items()
+        }
+
+    out = {}
+    for item in cdr_ranges:
+        if len(item) == 3:
+            chain_id, start, end = item
+            out.setdefault(str(chain_id), []).append((int(start), int(end)))
+        elif len(item) == 2:
+            chain_id, ranges = item
+            out.setdefault(str(chain_id), []).extend(
+                (int(start), int(end)) for start, end in ranges
+            )
+        else:
+            raise ValueError(f"Unsupported CDR range entry: {item!r}")
+    return {chain_id: tuple(ranges) for chain_id, ranges in out.items()}
+
+
+def _is_cdr_residue(chain_id, resseq, cdr_ranges):
+    ranges = cdr_ranges.get(chain_id, ())
+    return any(start <= int(resseq) <= end for start, end in ranges)
+
+
+def _cdr_loop_id(chain_id, resseq, cdr_ranges):
+    for start, end in cdr_ranges.get(chain_id, ()):
+        if start <= int(resseq) <= end:
+            return CDR_LOOP_IDS.get((chain_id, start, end), 1)
+    return 0
+
+
+def _get_model_metric(model, metric_name, *, task_scope="full_cdr"):
+    aliases = {
+        "loop_rmsd": ("loop_rmsd", "full_cdr_loop_rmsd", "cdr_loop_rmsd"),
+        "loop_lddt": ("loop_lddt", "full_cdr_loop_lddt", "cdr_loop_lddt"),
+        "h3_rmsd": ("h3_rmsd", "loop_rmsd"),
+        "h3_lddt": ("h3_lddt", "loop_lddt"),
+    }
+    if task_scope == "h3":
+        aliases = {
+            **aliases,
+            "loop_rmsd": ("h3_rmsd", "loop_rmsd"),
+            "loop_lddt": ("h3_lddt", "loop_lddt"),
+        }
+    for attr in aliases.get(metric_name, (metric_name,)):
+        value = getattr(model, attr, None)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return float("nan")
 
 
 def _parse_seed_sample_from_filename(filename: str):
@@ -112,7 +191,13 @@ def get_residue_atom_coords(res, expected_atoms, max_atoms):
         coords.append(np.zeros(3))
     return np.array(coords)
 
-def create_dictionary_from_model(model, use_all_atom=False, h3_range=(95,102)):
+def create_dictionary_from_model(
+    model,
+    use_all_atom=False,
+    h3_range=(95, 102),
+    cdr_ranges=DEFAULT_CDR_RANGES,
+    task_scope="full_cdr",
+):
     """
     Processes a Bio.PDB structure (Model object) and returns a dictionary with 
     pre-computed features.
@@ -121,7 +206,8 @@ def create_dictionary_from_model(model, use_all_atom=False, h3_range=(95,102)):
     Torsion keys from get_coords6d: 'dist6d', 'phi6d', 'omega6d', 'theta6d', 'phi_res', 'psi_res'
     
     - Effective residue numbers are reassigned consecutively per chain.
-    - ULR mask is computed from h3_range (in effective numbering).
+    - ULR mask is full-CDR by default. Pass ``task_scope="h3"`` or
+      ``cdr_ranges=None`` to keep the legacy H3-only mask.
     """
     ca_coords_list = []      # List of CA coordinates (L,3)
     all_coords_list = []     # List of full coordinate tensors (L, max_atoms,3)
@@ -176,12 +262,42 @@ def create_dictionary_from_model(model, use_all_atom=False, h3_range=(95,102)):
 
     aa_type_tensor = torch.tensor([AA3_IDX.get(aa, AA3_IDX['UNK']) for aa in aa_types], dtype=torch.int64)  # (L,)
     
-    # Build ULR mask from h3_range and structure mask
-    ulr_mask = torch.tensor(
-    [1 if (cid == 'H' and h3_range[0] <= res <= h3_range[1]) else 0 
-     for res, cid in zip(orig_resseq_list, chain_ids)],
-    dtype=torch.int64
-)
+    cdr_ranges = None if task_scope == "h3" else _normalize_cdr_ranges(cdr_ranges)
+    if cdr_ranges:
+        ulr_mask = torch.tensor(
+            [
+                1 if _is_cdr_residue(cid, res, cdr_ranges) else 0
+                for res, cid in zip(orig_resseq_list, chain_ids)
+            ],
+            dtype=torch.int64,
+        )
+        loop_id = torch.tensor(
+            [
+                _cdr_loop_id(cid, res, cdr_ranges)
+                for res, cid in zip(orig_resseq_list, chain_ids)
+            ],
+            dtype=torch.int64,
+        )
+    else:
+        ulr_mask = torch.tensor(
+            [
+                1 if (cid == 'H' and h3_range[0] <= res <= h3_range[1]) else 0
+                for res, cid in zip(orig_resseq_list, chain_ids)
+            ],
+            dtype=torch.int64,
+        )
+        loop_id = torch.tensor(
+            [
+                3 if (cid == 'H' and h3_range[0] <= res <= h3_range[1]) else 0
+                for res, cid in zip(orig_resseq_list, chain_ids)
+            ],
+            dtype=torch.int64,
+        )
+    if int(ulr_mask.sum().item()) == 0:
+        logger.warning(
+            "create_dictionary_from_model: zero CDR residues detected for %s",
+            getattr(model, "pdb_path", getattr(model, "method", "<unknown>")),
+        )
     str_mask = torch.ones(L, dtype=torch.int32) if use_all_atom else None
 
     # Create a dummy "get_res_idx" mapping
@@ -209,6 +325,7 @@ def create_dictionary_from_model(model, use_all_atom=False, h3_range=(95,102)):
     dic['chain_id'] = chain_id_tensor  # (L,)
     dic['str_mask'] = str_mask         # (L,) if use_all_atom else None
     dic['ulr_mask'] = ulr_mask         # (L,)
+    dic['loop_id'] = loop_id           # (L,), 0 non-CDR; 1-6 H1/H2/H3/L1/L2/L3
     dic['get_res_idx'] = get_res_idx   # dict mapping chain -> {orig_res_no: index}
     dic['coord_s'] = coord_s           # (1, L, max_atoms, 3)
     dic['is_gly'] = is_gly             # (L,)
@@ -347,6 +464,8 @@ def build_graph(dic, use_all_atom=False, dist_cut_off=10.0, max_neighbors=0):
 
     g.ndata['h'] = dic['aa_type']
     g.ndata['ulr'] = dic['ulr_mask']
+    if 'loop_id' in dic:
+        g.ndata['loop_id'] = dic['loop_id']
     if use_all_atom:
         g.ndata['str_mask'] = dic['str_mask']
     bb_torsion = torch.cat((dic['phi_res'][0].unsqueeze(-1).long(),
@@ -392,7 +511,10 @@ def generate_graphs_from_target(
     random_range=0.0,
     max_neighbors=0,
     use_all_atom=False,
-    h3_range=(95,102),
+    h3_range=(95, 102),
+    cdr_ranges=DEFAULT_CDR_RANGES,
+    task_scope="full_cdr",
+    label_metric="loop_rmsd",
 ):
     """
     For each model in the Target object, creates a dictionary via create_dictionary_from_model,
@@ -407,7 +529,13 @@ def generate_graphs_from_target(
     ranks = []
     decoy_meta = []
     for i, model in enumerate(target.models):
-        dic = create_dictionary_from_model(model, use_all_atom=use_all_atom, h3_range=h3_range)
+        dic = create_dictionary_from_model(
+            model,
+            use_all_atom=use_all_atom,
+            h3_range=h3_range,
+            cdr_ranges=cdr_ranges,
+            task_scope=task_scope,
+        )
         dist_cutoff = dist_cutoff_center + random.uniform(-random_range, random_range) if random_range > 0 else dist_cutoff_center
         dic = build_edge_mask(dic, dist_cut_off=dist_cutoff)
         g = build_graph(
@@ -417,7 +545,7 @@ def generate_graphs_from_target(
             max_neighbors=max_neighbors,
         )
         graphs.append(g)
-        rmsds.append(model.h3_rmsd)
+        rmsds.append(_get_model_metric(model, label_metric, task_scope=task_scope))
 
         ranking = getattr(model, 'ranking', None)
         if ranking == -1:

@@ -16,6 +16,15 @@ DEFAULT_LOOP_RANGES: Dict[str, Tuple[Tuple[int, int], ...]] = {
     "L": ((24, 34), (50, 56), (89, 97)),
 }
 
+DEFAULT_NAMED_LOOP_RANGES: Tuple[Tuple[str, str, int, int], ...] = (
+    ("H1", "H", 26, 32),
+    ("H2", "H", 52, 56),
+    ("H3", "H", 95, 102),
+    ("L1", "L", 24, 34),
+    ("L2", "L", 50, 56),
+    ("L3", "L", 89, 97),
+)
+
 
 @dataclass(frozen=True)
 class LoopMetricResult:
@@ -29,6 +38,8 @@ class LoopMetricResult:
     n_loop_residues: int
     align_residues: Tuple[Tuple[str, int], ...]
     loop_residues: Tuple[Tuple[str, int], ...]
+    per_cdr_rmsd: Dict[str, float]
+    per_cdr_lddt: Dict[str, float]
 
 
 def load_structure(path: Union[str, Path]) -> Structure.Structure:
@@ -88,6 +99,11 @@ def compute_loop_metrics_from_structures(
         loop_ranges=loop_ranges,
     )
     loop_lddt = _backbone_lddt(nat_pts, mod_pts, atom_to_res, loop_atom_mask)
+    per_cdr_rmsd, per_cdr_lddt = _compute_per_cdr_metrics(
+        matched_pairs,
+        loop_ranges=loop_ranges,
+        rmsd_atom_type=rmsd_atom_type,
+    )
 
     return LoopMetricResult(
         native_path=native_path,
@@ -100,7 +116,48 @@ def compute_loop_metrics_from_structures(
         n_loop_residues=loop_residue_count,
         align_residues=tuple(sorted(align_residues)),
         loop_residues=tuple(sorted(loop_residues)),
+        per_cdr_rmsd=per_cdr_rmsd,
+        per_cdr_lddt=per_cdr_lddt,
     )
+
+
+def _compute_per_cdr_metrics(
+    matched_pairs,
+    *,
+    loop_ranges: Dict[str, Tuple[Tuple[int, int], ...]],
+    rmsd_atom_type: str,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    per_cdr_rmsd: Dict[str, float] = {}
+    per_cdr_lddt: Dict[str, float] = {}
+    available = {
+        (chain_id, start, end)
+        for chain_id, ranges in loop_ranges.items()
+        for start, end in ranges
+    }
+    for name, chain_id, start, end in DEFAULT_NAMED_LOOP_RANGES:
+        if (chain_id, start, end) not in available:
+            continue
+        single_range = {chain_id: ((start, end),)}
+        (
+            align_nat,
+            align_mod,
+            loop_nat,
+            loop_mod,
+            _align_residues,
+            _loop_residues,
+        ) = _collect_loop_rmsd_atoms(
+            matched_pairs,
+            loop_ranges=single_range,
+            atom_type=rmsd_atom_type,
+        )
+        per_cdr_rmsd[name] = _aligned_rmsd(align_nat, align_mod, loop_nat, loop_mod)
+
+        nat_pts, mod_pts, atom_to_res, loop_atom_mask, _loop_residue_count = _collect_backbone_pairs(
+            matched_pairs,
+            loop_ranges=single_range,
+        )
+        per_cdr_lddt[name] = _backbone_lddt(nat_pts, mod_pts, atom_to_res, loop_atom_mask)
+    return per_cdr_rmsd, per_cdr_lddt
 
 
 def _iter_matched_residue_pairs(native_model, model_model):
