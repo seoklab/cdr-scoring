@@ -123,6 +123,9 @@ def resolve_target_af3_dir(
     af3_root: Union[str, Path],
 ) -> Path:
     af3_root = Path(af3_root)
+    exact_match = af3_root / str(target_id)
+    if exact_match.is_dir():
+        return exact_match
     match = _match_path_case_insensitive(af3_root, target_id)
     if match is None or not match.is_dir():
         raise FileNotFoundError(f"AF3 directory not found for target {target_id}: {af3_root}")
@@ -391,6 +394,8 @@ def make_structure_graph_loader(
     max_neighbors: int = 60,
     use_all_atom: bool = False,
     num_workers: int = 0,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
     shuffle: bool = False,
 ) -> DataLoader:
     dataset = OnTheFlyStructureGraphDataset(
@@ -407,6 +412,8 @@ def make_structure_graph_loader(
         num_workers=num_workers,
         collate_fn=collate_structure_graphs,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=bool(num_workers > 0 and persistent_workers),
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
 
@@ -419,6 +426,8 @@ def make_structure_inference_loader(
     max_neighbors: int = 60,
     use_all_atom: bool = False,
     num_workers: int = 0,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
 ) -> DataLoader:
     samples = discover_structure_samples(input_dir)
     samples = attach_af3_ranking(samples, load_af3_ranking_scores(input_dir))
@@ -430,5 +439,7 @@ def make_structure_inference_loader(
         max_neighbors=max_neighbors,
         use_all_atom=use_all_atom,
         num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
         shuffle=False,
     )

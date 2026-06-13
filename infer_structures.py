@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+from tqdm.auto import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -26,8 +27,8 @@ from data_loading.structure_graph_dataset import (  # noqa: E402
     resolve_target_native_path,
     StructureSample,
 )
-from evaluation.docking_metrics import compute_dockq_style_metrics  # noqa: E402
-from evaluation.loop_metrics import compute_loop_metrics  # noqa: E402
+from evaluation.loop_metrics import compute_loop_metrics_from_structures, load_structure  # noqa: E402
+from evaluation.docking_metrics import compute_dockq_style_metrics_from_structures  # noqa: E402
 from model.fiber import Fiber  # noqa: E402
 from model.transformer import Sujin_with_SE3, Sujin_with_SE3_allatom  # noqa: E402
 
@@ -64,6 +65,18 @@ def parse_args():
     parser.add_argument("--output-pkl", default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--log-every-batches",
+        type=int,
+        default=100,
+        help="Emit a batch progress log every N batches. Set 0 to disable batch logs.",
+    )
+    parser.add_argument(
+        "--score-only",
+        action="store_true",
+        help="Run model scoring only and skip structural metric calculation.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--all-atom", action="store_true")
@@ -170,6 +183,8 @@ def main():
             max_neighbors=args.max_neighbors,
             use_all_atom=args.all_atom,
             num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            persistent_workers=True,
             shuffle=False,
         )
     else:
@@ -207,10 +222,49 @@ def main():
             max_neighbors=args.max_neighbors,
             use_all_atom=args.all_atom,
             num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            persistent_workers=True,
             shuffle=False,
         )
     if len(loader.dataset) == 0:
         raise ValueError("No input structures found for inference")
+
+    target_ids = sorted(
+        {
+            getattr(sample, "target_id", "") or Path(sample.path).parent.name
+            for sample in loader.dataset.samples
+        }
+    )
+    print("[inference] starting structure scoring", flush=True)
+    print(
+        f"[inference] mode={'info-pkl' if args.input_info_pkl else 'single-dir'} "
+        f"device={device} batch_size={args.batch_size} num_workers={args.num_workers} "
+        f"prefetch_factor={args.prefetch_factor if args.num_workers > 0 else 'n/a'}",
+        flush=True,
+    )
+    if args.input_info_pkl:
+        print(f"[inference] info_pkl={args.input_info_pkl}", flush=True)
+        print(f"[inference] af3_root={args.af3_root}", flush=True)
+        print(f"[inference] native_root={args.native_root}", flush=True)
+    else:
+        print(f"[inference] input_dir={args.input_dir}", flush=True)
+        print(f"[inference] native_root={args.native_root}", flush=True)
+    print(f"[inference] checkpoint={args.checkpoint}", flush=True)
+    print(f"[inference] output_csv={args.output_csv}", flush=True)
+    if args.output_pkl:
+        print(f"[inference] output_pkl={args.output_pkl}", flush=True)
+    print(
+        f"[inference] cdr_ranges={args.cdr_ranges} "
+        f"dist_cutoff={args.dist_cutoff} max_neighbors={args.max_neighbors} "
+        f"all_atom={args.all_atom} low_memory={args.low_memory} "
+        f"score_only={args.score_only}",
+        flush=True,
+    )
+    print(
+        f"[inference] targets={len(target_ids)} structures={len(loader.dataset)} "
+        f"expected_batches={len(loader)}",
+        flush=True,
+    )
 
     model = build_model(args).to(device)
     missing, unexpected = load_checkpoint(model, args.checkpoint, device)
@@ -221,8 +275,23 @@ def main():
     model.eval()
 
     rows = []
+    native_structure_cache = {}
     with torch.inference_mode():
-        for batched_graph, metas in loader:
+        for batch_idx, (batched_graph, metas) in enumerate(
+            tqdm(loader, desc="Inference", unit="batch"),
+            start=1,
+        ):
+            if args.log_every_batches and (
+                batch_idx == 1 or batch_idx % args.log_every_batches == 0 or batch_idx == len(loader)
+            ):
+                batch_targets = sorted(
+                    {meta.get("target_id", "") for meta in metas if meta.get("target_id")}
+                )
+                print(
+                    f"[inference] batch={batch_idx}/{len(loader)} batch_size={len(metas)} "
+                    f"targets={batch_targets[:5]}{'...' if len(batch_targets) > 5 else ''}",
+                    flush=True,
+                )
             batched_graph = batched_graph.to(device)
             with torch.autocast(
                 device_type=device.type,
@@ -233,15 +302,24 @@ def main():
                 native_path = meta.get("native_path")
                 loop_metrics = None
                 dock_metrics = None
-                if native_path:
-                    loop_metrics = compute_loop_metrics(
-                        native_path,
-                        meta["path"],
+                if native_path and not args.score_only:
+                    native_structure = native_structure_cache.get(native_path)
+                    if native_structure is None:
+                        native_structure = load_structure(native_path)
+                        native_structure_cache[native_path] = native_structure
+                    model_structure = load_structure(meta["path"])
+                    loop_metrics = compute_loop_metrics_from_structures(
+                        native_structure,
+                        model_structure,
+                        native_path=native_path,
+                        model_path=meta["path"],
                         rmsd_atom_type="backbone",
                     )
-                    dock_metrics = compute_dockq_style_metrics(
-                        native_path,
-                        meta["path"],
+                    dock_metrics = compute_dockq_style_metrics_from_structures(
+                        native_structure,
+                        model_structure,
+                        native_path=native_path,
+                        model_path=meta["path"],
                     )
                 rows.append(
                     {
