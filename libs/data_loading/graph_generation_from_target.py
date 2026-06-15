@@ -7,9 +7,15 @@ from .constants import MAX_REL_INDEX, AA3_IDX, restype_name_to_atom14_names, MAX
 import random
 import re
 import logging
+import time
 
 
 logger = logging.getLogger(__name__)
+
+
+def _profile_add(profile_timings, key, value):
+    if profile_timings is not None:
+        profile_timings[key] = profile_timings.get(key, 0.0) + float(value)
 
 
 DEFAULT_CDR_RANGES = {
@@ -25,6 +31,17 @@ CDR_LOOP_IDS = {
     ("L", 50, 56): 5,
     ("L", 89, 97): 6,
 }
+
+CDR_LOOP_NAMES = {
+    ("H", 26, 32): "H1",
+    ("H", 52, 56): "H2",
+    ("H", 95, 102): "H3",
+    ("L", 24, 34): "L1",
+    ("L", 50, 56): "L2",
+    ("L", 89, 97): "L3",
+}
+
+CDR_LOOP_NAME_ORDER = ("H1", "H2", "H3", "L1", "L2", "L3")
 
 
 def _normalize_cdr_ranges(cdr_ranges):
@@ -61,6 +78,91 @@ def _cdr_loop_id(chain_id, resseq, cdr_ranges):
         if start <= int(resseq) <= end:
             return CDR_LOOP_IDS.get((chain_id, start, end), 1)
     return 0
+
+
+def _cdr_loop_name(chain_id, resseq, cdr_ranges):
+    for start, end in cdr_ranges.get(chain_id, ()):
+        if start <= int(resseq) <= end:
+            return CDR_LOOP_NAMES.get((chain_id, start, end), f"{chain_id}:{start}-{end}")
+    return None
+
+
+def _model_identifier(model, target_id=None):
+    if target_id:
+        return str(target_id)
+    pdb_path = getattr(model, "pdb_path", None)
+    if pdb_path is not None:
+        return getattr(pdb_path, "stem", str(pdb_path))
+    return str(getattr(model, "method", "<unknown>"))
+
+
+def _crop_to_cdr_context(
+    *,
+    ca_coords_list,
+    orig_resseq_list,
+    chain_ids,
+    cdr_ranges,
+    cdr_context_cutoff,
+    max_context_residues,
+    graph_crop_debug,
+    model,
+    target_id=None,
+):
+    original_n = len(ca_coords_list)
+    loop_counts = {name: 0 for name in CDR_LOOP_NAME_ORDER}
+    cdr_indices = []
+    non_cdr_indices = []
+
+    for idx, (chain_id, resseq) in enumerate(zip(chain_ids, orig_resseq_list)):
+        loop_name = _cdr_loop_name(chain_id, resseq, cdr_ranges)
+        if loop_name is None:
+            non_cdr_indices.append(idx)
+            continue
+        cdr_indices.append(idx)
+        if loop_name in loop_counts:
+            loop_counts[loop_name] += 1
+
+    target = _model_identifier(model, target_id=target_id)
+    if not cdr_indices:
+        logger.warning("[CDR_CROP] target=%s zero CDR residues found; cannot build CDR-context graph", target)
+        raise ValueError(f"No CDR residues found for CDR-context graph: {target}")
+
+    for loop_name in ("H1", "H2", "H3"):
+        if loop_counts.get(loop_name, 0) == 0:
+            logger.warning("[CDR_CROP] target=%s expected CDR loop %s has zero residues", target, loop_name)
+
+    ca_coords = np.asarray(ca_coords_list, dtype=np.float32)
+    cdr_coords = ca_coords[cdr_indices]
+    context_candidates = []
+    cutoff = float(cdr_context_cutoff)
+    max_context = max(0, int(max_context_residues))
+
+    for idx in non_cdr_indices:
+        dists = np.linalg.norm(cdr_coords - ca_coords[idx], axis=1)
+        min_dist = float(np.min(dists))
+        if min_dist <= cutoff:
+            context_candidates.append((min_dist, idx))
+
+    context_candidates.sort(key=lambda item: (item[0], item[1]))
+    truncated = len(context_candidates) > max_context
+    context_indices = [idx for _dist, idx in context_candidates[:max_context]]
+    if not context_indices:
+        logger.warning("[CDR_CROP] target=%s cropped graph has CDR residues only and no context residues", target)
+
+    selected = sorted(cdr_indices + context_indices)
+    chains = ",".join(sorted({chain_ids[idx] for idx in selected}))
+    if graph_crop_debug:
+        msg = (
+            f"[CDR_CROP] target={target} mode=cdr_context original={original_n} "
+            f"cropped={len(selected)} cdr={len(cdr_indices)} context={len(context_indices)} "
+            f"cutoff={cutoff:.1f} max_context={max_context} truncated={truncated} "
+            f"chains={chains} loops="
+            + ",".join(f"{name}:{loop_counts[name]}" for name in CDR_LOOP_NAME_ORDER)
+        )
+        print(msg, flush=True)
+        logger.info(msg)
+
+    return selected
 
 
 def _get_model_metric(model, metric_name, *, task_scope="full_cdr"):
@@ -197,6 +299,11 @@ def create_dictionary_from_model(
     h3_range=(95, 102),
     cdr_ranges=DEFAULT_CDR_RANGES,
     task_scope="full_cdr",
+    cdr_context_cutoff=15.0,
+    max_context_residues=120,
+    graph_crop_debug=False,
+    target_id=None,
+    profile_timings=None,
 ):
     """
     Processes a Bio.PDB structure (Model object) and returns a dictionary with 
@@ -209,6 +316,8 @@ def create_dictionary_from_model(
     - ULR mask is full-CDR by default. Pass ``task_scope="h3"`` or
       ``cdr_ranges=None`` to keep the legacy H3-only mask.
     """
+    t_start = time.perf_counter()
+    crop_time = 0.0
     ca_coords_list = []      # List of CA coordinates (L,3)
     all_coords_list = []     # List of full coordinate tensors (L, max_atoms,3)
     orig_resseq_list = []    # Original residue numbers (integer part)
@@ -241,6 +350,27 @@ def create_dictionary_from_model(
     
     if len(ca_coords_list) == 0:
         raise ValueError("No valid CA atoms found in the structure.")
+
+    cdr_ranges = None if task_scope == "h3" else _normalize_cdr_ranges(cdr_ranges)
+    if cdr_ranges:
+        t_crop = time.perf_counter()
+        selected_indices = _crop_to_cdr_context(
+            ca_coords_list=ca_coords_list,
+            orig_resseq_list=orig_resseq_list,
+            chain_ids=chain_ids,
+            cdr_ranges=cdr_ranges,
+            cdr_context_cutoff=cdr_context_cutoff,
+            max_context_residues=max_context_residues,
+            graph_crop_debug=graph_crop_debug,
+            model=model,
+            target_id=target_id,
+        )
+        crop_time += time.perf_counter() - t_crop
+        ca_coords_list = [ca_coords_list[i] for i in selected_indices]
+        all_coords_list = [all_coords_list[i] for i in selected_indices]
+        orig_resseq_list = [orig_resseq_list[i] for i in selected_indices]
+        chain_ids = [chain_ids[i] for i in selected_indices]
+        aa_types = [aa_types[i] for i in selected_indices]
     
     L = len(ca_coords_list)
     all_coords = np.stack(all_coords_list, axis=0)    # (L, max_atoms,3)
@@ -262,7 +392,6 @@ def create_dictionary_from_model(
 
     aa_type_tensor = torch.tensor([AA3_IDX.get(aa, AA3_IDX['UNK']) for aa in aa_types], dtype=torch.int64)  # (L,)
     
-    cdr_ranges = None if task_scope == "h3" else _normalize_cdr_ranges(cdr_ranges)
     if cdr_ranges:
         ulr_mask = torch.tensor(
             [
@@ -336,6 +465,8 @@ def create_dictionary_from_model(
     dic['phi_res'] = phi_res
     dic['psi_res'] = psi_res
 
+    _profile_add(profile_timings, "cdr_crop_time", crop_time)
+    _profile_add(profile_timings, "node_feature_time", time.perf_counter() - t_start - crop_time)
     return dic
 
 def build_edge_mask(dic, dist_cut_off=10.0):
@@ -385,7 +516,7 @@ def _build_edge_mask_from_distance(diff, dist_cut_off=10.0, max_neighbors=0):
     return radius_mask & knn_mask
 
 
-def build_graph(dic, use_all_atom=False, dist_cut_off=10.0, max_neighbors=0):
+def build_graph(dic, use_all_atom=False, dist_cut_off=10.0, max_neighbors=0, profile_timings=None):
     """
     Generates a DGLGraph from the precomputed dictionary.
     
@@ -411,6 +542,7 @@ def build_graph(dic, use_all_atom=False, dist_cut_off=10.0, max_neighbors=0):
     Returns:
         g: DGLGraph with the above node and edge features.
     """
+    t_edge = time.perf_counter()
     B, L, max_atoms, _ = dic['coord_s'].shape
     if use_all_atom:
         ca_index = 1
@@ -458,7 +590,8 @@ def build_graph(dic, use_all_atom=False, dist_cut_off=10.0, max_neighbors=0):
         bond_type_onehot = torch.nn.functional.one_hot(bond_types, num_classes=2).float()
         # Concatenate 25-dim heavy atom distances with 2-dim bond type => (num_edges, 27)
         basic_edge_feat = torch.cat([edge_feats, bond_type_onehot], dim=1)
-    
+    _profile_add(profile_timings, "edge_feature_time", time.perf_counter() - t_edge)
+    t_dgl = time.perf_counter()
     g = dgl.graph((src, dst), num_nodes=L)
     
 
@@ -500,7 +633,7 @@ def build_graph(dic, use_all_atom=False, dist_cut_off=10.0, max_neighbors=0):
         l1 = heavy_coords - ca_tensor.unsqueeze(1)           # (L, 4, 3)
         g.ndata['l1'] = l1
 
-
+    _profile_add(profile_timings, "dgl_graph_build_time", time.perf_counter() - t_dgl)
     return g
 
 
@@ -515,6 +648,10 @@ def generate_graphs_from_target(
     cdr_ranges=DEFAULT_CDR_RANGES,
     task_scope="full_cdr",
     label_metric="loop_rmsd",
+    cdr_context_cutoff=15.0,
+    max_context_residues=120,
+    graph_crop_debug=False,
+    target_id=None,
 ):
     """
     For each model in the Target object, creates a dictionary via create_dictionary_from_model,
@@ -535,6 +672,10 @@ def generate_graphs_from_target(
             h3_range=h3_range,
             cdr_ranges=cdr_ranges,
             task_scope=task_scope,
+            cdr_context_cutoff=cdr_context_cutoff,
+            max_context_residues=max_context_residues,
+            graph_crop_debug=graph_crop_debug,
+            target_id=target_id,
         )
         dist_cutoff = dist_cutoff_center + random.uniform(-random_range, random_range) if random_range > 0 else dist_cutoff_center
         dic = build_edge_mask(dic, dist_cut_off=dist_cutoff)

@@ -1,6 +1,25 @@
 import copy
-import ml_collections as mlc
-config = mlc.ConfigDict(
+
+
+class _ConfigDict(dict):
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+
+try:
+    import ml_collections as mlc
+    _config_dict = mlc.ConfigDict
+except ModuleNotFoundError:
+    _config_dict = _ConfigDict
+
+
+config = _config_dict(
     {
         "heads": {
                 'aa_score':True,

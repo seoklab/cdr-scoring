@@ -308,9 +308,8 @@ class Sujin_with_SE3(nn.Module):
                     current_idx += num_nodes_per_graph[i]
                 out_dic['nodewise_score'] = nodewise_score_filtered
         except Exception as e:
-            print(traceback.print_exc())
-            import sys
-            sys.exit()
+            traceback.print_exc()
+            raise
         #out_dic['out_cee']=out_cee
         #out_dic['out_sml']=out_sml
         return out_dic
@@ -486,5 +485,4 @@ class Sujin_with_SE3_allatom(nn.Module):
                             type=int, default=2)
         parser.add_argument('--num_channels', help='Number of channels for the hidden features', type=int, default=32)
         return parent_parser
-
 

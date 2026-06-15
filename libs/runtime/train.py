@@ -2,14 +2,20 @@ import logging
 import pathlib
 from typing import List
 import sys,pickle
-sys.path.insert(0,'/home/sujin/projects/h3-loop-modeling/libs/')
+_CURRENT_LIBS_DIR = str(pathlib.Path(__file__).resolve().parents[1])
+if _CURRENT_LIBS_DIR not in sys.path:
+    sys.path.insert(0, _CURRENT_LIBS_DIR)
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ModuleNotFoundError:
+    def tqdm(iterable=None, *args, **kwargs):
+        return iterable if iterable is not None else []
 from torch.optim import AdamW
 from data_loading.data_module import HUDataModule
 from data_loading.pdb2dict import Target, Model
@@ -42,6 +48,7 @@ import traceback
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:256')
 import copy
 import warnings
+import time
 
 
 import dgl
@@ -200,6 +207,107 @@ def _get_total_nodes(batched_graph):
     return -1
 
 
+def _cuda_sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _graph_batch_stats(batched_graph):
+    stats = {
+        "n_graphs": 1,
+        "total_nodes": -1,
+        "total_edges": -1,
+        "max_nodes_per_graph": -1,
+        "max_edges_per_graph": -1,
+    }
+    try:
+        stats["total_nodes"] = int(batched_graph.num_nodes())
+    except Exception:
+        pass
+    try:
+        stats["total_edges"] = int(batched_graph.num_edges())
+    except Exception:
+        pass
+    try:
+        if hasattr(batched_graph, "batch_num_nodes"):
+            node_counts = batched_graph.batch_num_nodes()
+            node_counts = node_counts.tolist() if hasattr(node_counts, "tolist") else list(node_counts)
+            if node_counts:
+                stats["n_graphs"] = len(node_counts)
+                stats["max_nodes_per_graph"] = int(max(node_counts))
+                if stats["total_nodes"] < 0:
+                    stats["total_nodes"] = int(sum(int(x) for x in node_counts))
+    except Exception:
+        pass
+    try:
+        if hasattr(batched_graph, "batch_num_edges"):
+            edge_counts = batched_graph.batch_num_edges()
+            edge_counts = edge_counts.tolist() if hasattr(edge_counts, "tolist") else list(edge_counts)
+            if edge_counts:
+                stats["max_edges_per_graph"] = int(max(edge_counts))
+                if stats["total_edges"] < 0:
+                    stats["total_edges"] = int(sum(int(x) for x in edge_counts))
+    except Exception:
+        pass
+    return stats
+
+
+class _TrainingProfiler:
+    def __init__(self, enabled, interval, local_rank):
+        self.enabled = bool(enabled) and local_rank == 0
+        self.interval = max(1, int(interval or 20))
+        self.local_rank = local_rank
+        self.count = 0
+        self.totals = {}
+        self.latest_stats = {}
+
+    def add(self, timings, stats):
+        if not self.enabled:
+            return
+        self.count += 1
+        for key, value in timings.items():
+            self.totals[key] = self.totals.get(key, 0.0) + float(value)
+        self.latest_stats = dict(stats)
+        if self.count % self.interval == 0:
+            self.log()
+            self.totals = {}
+
+    def log(self):
+        if not self.enabled or self.count <= 0 or not self.totals:
+            return
+        denom = float(self.interval if self.count % self.interval == 0 else self.count % self.interval)
+        mem_alloc = torch.cuda.memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0
+        mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3) if torch.cuda.is_available() else 0.0
+        timing_txt = " ".join(
+            f"{key}={self.totals.get(key, 0.0) / denom:.4f}s"
+            for key in (
+                "dataloader",
+                "transfer",
+                "forward",
+                "loss",
+                "backward",
+                "optimizer",
+                "total",
+            )
+        )
+        stats_txt = " ".join(
+            f"{key}={self.latest_stats.get(key, -1)}"
+            for key in (
+                "n_graphs",
+                "total_nodes",
+                "total_edges",
+                "max_nodes_per_graph",
+                "max_edges_per_graph",
+            )
+        )
+        print(
+            f"[TRAIN_PROFILE] steps={self.count} avg_over={int(denom)} "
+            f"{timing_txt} {stats_txt} "
+            f"gpu_allocated_gb={mem_alloc:.3f} gpu_reserved_gb={mem_reserved:.3f}",
+            flush=True,
+        )
+
+
 def _should_skip_oversized_batch(batched_graph, pdb, epoch_idx, batch_idx, train_tag, args, local_rank):
     """Synchronously skip oversized batches across ranks to avoid DDP desync."""
     max_nodes = int(getattr(args, 'max_batch_nodes', 0) or 0)
@@ -335,22 +443,41 @@ def run_epoch(model,dataloader, epoch_idx, grad_scaler, optimizer, local_rank,
     ##
     loss_fn=Sujin_loss()
     info_dict={}
+    profiler = _TrainingProfiler(
+        getattr(args, "profile_training", False),
+        getattr(args, "profile_log_interval", 20),
+        local_rank,
+    )
+    last_step_end = time.perf_counter()
     
     for i, batch in tqdm(enumerate(dataloader), total=len(dataloader), unit='batch',
                          #desc=f'{train_tag} Epoch {epoch_idx}', disable=(True)):
                          desc=f'{train_tag} Epoch {epoch_idx}', disable=(local_rank != 0)):
+        batch_ready_t = time.perf_counter()
+        dataloader_time = batch_ready_t - last_step_end
+        _cuda_sync()
+        step_start_t = time.perf_counter()
+        transfer_start_t = step_start_t
         batched_graph, rmsd_s = to_cuda(batch[0:2])
+        _cuda_sync()
+        transfer_time = time.perf_counter() - transfer_start_t
         pdb = batch[2]
         node_info = _batch_node_info(batched_graph)
+        graph_stats = _graph_batch_stats(batched_graph)
         if _should_skip_oversized_batch(batched_graph, pdb, epoch_idx, i, train_tag, args, local_rank):
             del batched_graph, rmsd_s
             torch.cuda.empty_cache()
+            last_step_end = time.perf_counter()
             continue
         try:
             for callback in callbacks:
                 callback.on_batch_start()
             with torch.cuda.amp.autocast(enabled=args.amp):
+                _cuda_sync()
+                forward_start_t = time.perf_counter()
                 pred = model(batched_graph)
+                _cuda_sync()
+                forward_time = time.perf_counter() - forward_start_t
                 device=pred['out'].device
 
                 # TODO: Add loss function for nodewise score
@@ -358,12 +485,18 @@ def run_epoch(model,dataloader, epoch_idx, grad_scaler, optimizer, local_rank,
                     nodewise_score = pred['nodewise_score']
                     print('nodewise_score ',len(nodewise_score), nodewise_score[0].shape)
 
+                _cuda_sync()
+                loss_start_t = time.perf_counter()
                 loss,loss_dic=loss_fn(pdb,rmsd_s,pred['out'],training,device,inference,rmsd_cutoff=2.0,loss_type=args.loss_type)
                 # Detach GPU tensors in loss_dic to prevent holding computation graph
                 info_dict[pdb] = {k: (v.detach().cpu().item() if isinstance(v, torch.Tensor) else v) for k, v in loss_dic.items()}
                 loss = loss/args.accumulate_grad_batches
+                _cuda_sync()
+                loss_time = time.perf_counter() - loss_start_t
             ###
             epoch_loss=update_epoch_loss(epoch_loss,loss_dic)
+            backward_time = 0.0
+            optimizer_time = 0.0
             if is_train:
                 def _zero_dummy_pretrain():
                     d = pred['out'].sum() * 0.0
@@ -380,21 +513,44 @@ def run_epoch(model,dataloader, epoch_idx, grad_scaler, optimizer, local_rank,
                     with open(f'{nan_path}/{pdb}.dat','wb')as fp:
                         pickle.dump([pred['out'].detach().cpu(),rmsd_s.detach().cpu()],fp)
                     loss = _zero_dummy_pretrain()
+                _cuda_sync()
+                backward_start_t = time.perf_counter()
                 grad_scaler.scale(loss).backward()
+                _cuda_sync()
+                backward_time = time.perf_counter() - backward_start_t
                 # Free GPU memory from this batch before the next optimizer step
                 del batched_graph, pred, loss_dic
                 if (i + 1) % args.accumulate_grad_batches == 0 or (i + 1) == len(dataloader):
+                    _cuda_sync()
+                    optimizer_start_t = time.perf_counter()
                     if args.gradient_clip:
                         grad_scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
                     optimizer.zero_grad(set_to_none=True)
+                    _cuda_sync()
+                    optimizer_time = time.perf_counter() - optimizer_start_t
                 del loss
                 torch.cuda.empty_cache()
             else:
                 del batched_graph, pred, loss, loss_dic
                 torch.cuda.empty_cache()
+            _cuda_sync()
+            total_time = time.perf_counter() - step_start_t
+            profiler.add(
+                {
+                    "dataloader": dataloader_time,
+                    "transfer": transfer_time,
+                    "forward": forward_time,
+                    "loss": loss_time,
+                    "backward": backward_time,
+                    "optimizer": optimizer_time,
+                    "total": total_time,
+                },
+                graph_stats,
+            )
+            last_step_end = time.perf_counter()
         except RuntimeError as e:
             if 'out of memory' in str(e).lower():
                 msg = (
@@ -405,6 +561,7 @@ def run_epoch(model,dataloader, epoch_idx, grad_scaler, optimizer, local_rank,
                 torch.cuda.empty_cache()
                 raise RuntimeError(msg) from e
             raise
+    profiler.log()
     with torch.no_grad():
         epoch_loss=finalize_epoch_loss(epoch_loss)
     with open('/home/sujin/projects/h3-loop-modeling/libs/results/%s/%s.%i.%i.info'%(args.param_name,train_tag,epoch_idx,local_rank,),'wb')as fp:
@@ -421,9 +578,7 @@ def train(model: nn.Module,
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     data_module = HUDataModule()
     if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank
-                #find_unused_parameters=True
-                )
+        model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
         model._set_static_graph()
     model.train()
     grad_scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
@@ -459,11 +614,15 @@ def train(model: nn.Module,
     # Load YAML spec once (used for list paths and forwarded to MyDataset)
     _yaml_spec = None
     if dataset_config:
-        _libs_dir = '/home/sujin/projects/h3-loop-modeling/libs/'
+        _libs_dir = _CURRENT_LIBS_DIR
         if _libs_dir not in sys.path:
             sys.path.insert(0, _libs_dir)
         from dataset.config import load_dataset_spec
         _yaml_spec = load_dataset_spec(dataset_config)
+        args.profile_training = bool(getattr(_yaml_spec, "profile_training", getattr(args, "profile_training", False)))
+        args.profile_log_interval = int(getattr(_yaml_spec, "profile_log_interval", getattr(args, "profile_log_interval", 20)))
+        if get_local_rank() == 0 and args.profile_training:
+            print(f'[TRAIN_PROFILE] enabled interval={args.profile_log_interval}', flush=True)
 
     yaml_train_abag_pool = None
     yaml_valid_abag_pool = None
@@ -478,7 +637,8 @@ def train(model: nn.Module,
                 f"excluded(train/valid)=({yaml_meta['n_excluded_train_pool']}/{yaml_meta['n_excluded_valid_pool']})"
             )
 
-    for epoch_idx in range(epoch_start+1, 1000):
+    end_epoch = epoch_start + int(args.epochs)
+    for epoch_idx in range(epoch_start + 1, end_epoch + 1):
         # ── Build training / validation lists ──
         if _yaml_spec and (_yaml_spec.train_list or getattr(_yaml_spec, "train_list_from_pkl", "")):
             # YAML-driven: read abag + gp lists, random sample like set_data()
@@ -984,7 +1144,7 @@ def finetune(
         print(f'[list exclusion] loaded {len(excluded_pdbs)} excluded pdb ids')
     _yaml_spec = None
     if dataset_config:
-        _libs_dir = '/home/sujin/projects/h3-loop-modeling/libs/'
+        _libs_dir = _CURRENT_LIBS_DIR
         if _libs_dir not in sys.path:
             sys.path.insert(0, _libs_dir)
         from dataset.config import load_dataset_spec

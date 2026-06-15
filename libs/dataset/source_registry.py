@@ -151,21 +151,22 @@ class SourceRegistry:
     def _resolve_target_model_pickle(
         self, pdb_id: str, name: str, src: SourceSpec, db_root: str
     ) -> List[DecoyCandidate]:
-        # Check for cached graph pickle first
-        cache_root = self.spec.cache_root or os.path.join(db_root, "_graph_cache")
-        cache_path = os.path.join(cache_root, name, f"{pdb_id}.dat")
-        if _path_exists(cache_path):
-            # Cached version exists → treat as graph_pickle
-            rmsd_cache = os.path.join(cache_root, name, f"{pdb_id}.rmsd")
-            return [DecoyCandidate(
-                source_name=name,
-                file_type="graph_pickle",       # already converted
-                graph_path=cache_path,
-                rmsd_path=rmsd_cache if _path_exists(rmsd_cache) else None,
-                pdb_id=pdb_id,
-            )]
+        if not getattr(self.spec.graph_build, "on_the_fly", True):
+            # Check for cached graph pickle only when caching is explicitly enabled.
+            cache_root = self.spec.cache_root or os.path.join(db_root, "_graph_cache")
+            cache_path = os.path.join(cache_root, name, f"{pdb_id}.dat")
+            if _path_exists(cache_path):
+                # Cached version exists → treat as graph_pickle
+                rmsd_cache = os.path.join(cache_root, name, f"{pdb_id}.rmsd")
+                return [DecoyCandidate(
+                    source_name=name,
+                    file_type="graph_pickle",       # already converted
+                    graph_path=cache_path,
+                    rmsd_path=rmsd_cache if _path_exists(rmsd_cache) else None,
+                    pdb_id=pdb_id,
+                )]
 
-        # Not cached → need original Target/Model pickle
+        # On-the-fly mode, or no cache present → need original Target/Model pickle.
         pkl_path = _expand(src.target_pickle_template, pdb_id, db_root)
         if not _path_exists(pkl_path):
             fb = _glob_fallback(pkl_path)

@@ -14,11 +14,12 @@ from runtime.arguments import PARSER
 from data_loading.pdb2dict import Target, Model
 import dgl
 import sys
-import pickle,torch,random,os,glob
+import io
+import pickle,torch,random,os,glob,time
 from pathlib import Path
 import logging as _logging
+from evaluation.loop_metrics import compute_loop_metrics_from_structures
 
-sys.path.append('/home/sujin/projects/h3-loop-modeling/libs')
 DB_DIR = '/home/sujin/DB/h3-loop-modeling'
 
 # args = PARSER.parse_args()
@@ -67,6 +68,17 @@ def _load_target_pickle(path: str):
         return _TargetUnpickler(f).load()
 
 
+def _timed_load_target_pickle(path: str):
+    """Load a Target pickle and split file-read vs unpickle time."""
+    t0 = time.perf_counter()
+    with open(path, 'rb') as f:
+        payload = f.read()
+    t1 = time.perf_counter()
+    obj = _TargetUnpickler(io.BytesIO(payload)).load()
+    t2 = time.perf_counter()
+    return obj, t1 - t0, t2 - t1
+
+
 class _GraphPickleUnpickler(pickle.Unpickler):
     """DGL 1.x graph pickles reference DGLHeteroGraph; DGL 2.x uses DGLGraph."""
 
@@ -95,6 +107,48 @@ def _model_loop_label(model, spec=None):
     if task_scope == "h3":
         return _get_model_metric(model, "h3_rmsd", task_scope="h3")
     return float("nan")
+
+
+def _loop_ranges_from_spec(spec):
+    gb = getattr(spec, "graph_build", None)
+    raw_ranges = getattr(gb, "cdr_ranges", None)
+    if not raw_ranges:
+        return None
+    return {
+        chain: tuple((int(start), int(end)) for start, end in ranges)
+        for chain, ranges in raw_ranges.items()
+    }
+
+
+def _model_loop_label_from_target(model, target, spec=None):
+    value = _model_loop_label(model, spec)
+    if torch.isfinite(torch.tensor(value)):
+        return value
+
+    native_structure = getattr(target, "gt_structure", None)
+    model_structure = getattr(model, "md_structure", None)
+    if native_structure is None or model_structure is None:
+        return value
+
+    try:
+        loop_ranges = _loop_ranges_from_spec(spec)
+        kwargs = {"loop_ranges": loop_ranges} if loop_ranges else {}
+        metrics = compute_loop_metrics_from_structures(
+            native_structure,
+            model_structure,
+            **kwargs,
+        )
+    except Exception as exc:
+        _logging.debug("Failed to compute on-the-fly loop metrics: %s", exc)
+        return value
+
+    model.loop_rmsd = metrics.loop_rmsd
+    model.loop_lddt = metrics.loop_lddt
+    for cdr_name, cdr_value in metrics.per_cdr_rmsd.items():
+        setattr(model, f"{cdr_name.lower()}_rmsd", cdr_value)
+    for cdr_name, cdr_value in metrics.per_cdr_lddt.items():
+        setattr(model, f"{cdr_name.lower()}_lddt", cdr_value)
+    return _model_loop_label(model, spec)
 
 
 def _graph_build_cdr_ranges(gb):
@@ -595,6 +649,9 @@ class MyDataset(Dataset):
                     cdr_ranges=_graph_build_cdr_ranges(gb),
                     task_scope=spec.task_scope,
                     label_metric=spec.label_metric,
+                    cdr_context_cutoff=gb.cdr_context_cutoff,
+                    max_context_residues=gb.max_context_residues,
+                    graph_crop_debug=gb.graph_crop_debug,
                 )
                 if gp is None:
                     continue
@@ -690,6 +747,56 @@ class MyDataset(Dataset):
         epoch = self._epoch
         gb = spec.graph_build
         inference_yaml = (getattr(args, 'run_type', None) == 'inference')
+        profile_data_loading = bool(
+            getattr(spec, "profile_data_loading", False)
+            or getattr(gb, "graph_crop_debug", False)
+        )
+        data_profile = {
+            "read_structure_time": 0.0,
+            "parse_structure_time": 0.0,
+            "cdr_crop_time": 0.0,
+            "node_feature_time": 0.0,
+            "edge_feature_time": 0.0,
+            "dgl_graph_build_time": 0.0,
+            "metric_lookup_time": 0.0,
+            "total_getitem_time": 0.0,
+        }
+        getitem_t0 = time.perf_counter()
+
+        def _profile_add(key, value):
+            if profile_data_loading:
+                data_profile[key] = data_profile.get(key, 0.0) + float(value)
+
+        def _load_target_for_getitem(path):
+            if not profile_data_loading:
+                return _load_target_pickle(path)
+            obj, read_t, parse_t = _timed_load_target_pickle(path)
+            _profile_add("read_structure_time", read_t)
+            _profile_add("parse_structure_time", parse_t)
+            return obj
+
+        def _log_data_profile(graph_set=None, n_graphs=0):
+            if not profile_data_loading:
+                return
+            data_profile["total_getitem_time"] = time.perf_counter() - getitem_t0
+            total_nodes = int(graph_set.num_nodes()) if graph_set is not None else 0
+            total_edges = int(graph_set.num_edges()) if graph_set is not None else 0
+            msg = (
+                "[DATA_PROFILE] "
+                f"target={pdb_id} avg_over=1 "
+                f"read_structure_time={data_profile['read_structure_time']:.4f} "
+                f"parse_structure_time={data_profile['parse_structure_time']:.4f} "
+                f"cdr_crop_time={data_profile['cdr_crop_time']:.4f} "
+                f"node_feature_time={data_profile['node_feature_time']:.4f} "
+                f"edge_feature_time={data_profile['edge_feature_time']:.4f} "
+                f"dgl_graph_build_time={data_profile['dgl_graph_build_time']:.4f} "
+                f"metric_lookup_time={data_profile['metric_lookup_time']:.4f} "
+                f"total_getitem_time={data_profile['total_getitem_time']:.4f} "
+                f"n_graphs={int(n_graphs)} "
+                f"total_nodes={total_nodes} "
+                f"total_edges={total_edges}"
+            )
+            _logging.info(msg)
 
         # ── Phase 1: Resolve candidates and load RMSD only ──
         candidates = self._registry.get_candidates(pdb_id, epoch)
@@ -728,9 +835,11 @@ class MyDataset(Dataset):
                     # On-the-fly mode: load Target pickle for RMSD only,
                     # defer graph generation to Phase 3.
                     try:
-                        target_obj = _load_target_pickle(cand.target_model_path)
-                        all_rmsds = [_model_loop_label(m, spec) for m in target_obj.models]
+                        target_obj = _load_target_for_getitem(cand.target_model_path)
+                        t_metric = time.perf_counter()
+                        all_rmsds = [_model_loop_label_from_target(m, target_obj, spec) for m in target_obj.models]
                         ag_local_full = [_ag_local_from_model(m) for m in target_obj.models]
+                        _profile_add("metric_lookup_time", time.perf_counter() - t_metric)
                         target_pickle_path = cand.target_model_path
                         graph_path = None
                         rmsd_path = None
@@ -754,6 +863,9 @@ class MyDataset(Dataset):
                         cdr_ranges=_graph_build_cdr_ranges(gb),
                         task_scope=spec.task_scope,
                         label_metric=spec.label_metric,
+                        cdr_context_cutoff=gb.cdr_context_cutoff,
+                        max_context_residues=gb.max_context_residues,
+                        graph_crop_debug=gb.graph_crop_debug,
                     )
                     if gp is None:
                         continue
@@ -762,12 +874,14 @@ class MyDataset(Dataset):
 
             # Load RMSD only (small file) — skip for on-the-fly (already loaded above)
             if target_pickle_path is None:
+                t_metric = time.perf_counter()
                 all_rmsds = self._read_rmsd_only(rmsd_path)
                 ag_local_full = [float("nan")] * len(all_rmsds)
                 if metrics_path:
                     ag_map = load_ag_local_rmsd(metrics_path, metrics_format)
                     for i in range(len(all_rmsds)):
                         ag_local_full[i] = float(ag_map.get(i, float("nan")))
+                _profile_add("metric_lookup_time", time.perf_counter() - t_metric)
             if not all_rmsds:
                 continue
             if ag_local_full is None or len(ag_local_full) != len(all_rmsds):
@@ -889,7 +1003,7 @@ class MyDataset(Dataset):
             native_pkl = resolve_native_pickle_path(per_source)
             if native_pkl:
                 try:
-                    nat_target = _load_target_pickle(native_pkl)
+                    nat_target = _load_target_for_getitem(native_pkl)
                     if nat_target.gt_structure is not None:
                         native_cache = build_native_cache_from_gt_structure(
                             nat_target.gt_structure,
@@ -909,7 +1023,7 @@ class MyDataset(Dataset):
             if target_pkl is not None:
                 # On-the-fly: reload Target pickle and generate graphs for selected models only
                 try:
-                    target_obj = _load_target_pickle(target_pkl)
+                    target_obj = _load_target_for_getitem(target_pkl)
                     for idx in selected:
                         if idx < len(target_obj.models):
                             model = target_obj.models[idx]
@@ -919,16 +1033,24 @@ class MyDataset(Dataset):
                                 h3_range=tuple(gb.h3_range),
                                 cdr_ranges=_graph_build_cdr_ranges(gb),
                                 task_scope=spec.task_scope,
+                                cdr_context_cutoff=gb.cdr_context_cutoff,
+                                max_context_residues=gb.max_context_residues,
+                                graph_crop_debug=gb.graph_crop_debug,
+                                target_id=pdb_id,
+                                profile_timings=data_profile if profile_data_loading else None,
                             )
                             dist_cutoff = gb.dist_cutoff_center
                             if not inference_yaml and gb.random_range > 0:
                                 dist_cutoff += random.uniform(-gb.random_range, gb.random_range)
+                            t_edge_mask = time.perf_counter()
                             dic = build_edge_mask(dic, dist_cut_off=dist_cutoff)
+                            _profile_add("edge_feature_time", time.perf_counter() - t_edge_mask)
                             g = build_graph(
                                 dic,
                                 use_all_atom=gb.use_all_atom,
                                 dist_cut_off=dist_cutoff,
                                 max_neighbors=gb.max_neighbors,
+                                profile_timings=data_profile if profile_data_loading else None,
                             )
                             del dic
                             merged_graphs.append(g)
@@ -1005,8 +1127,8 @@ class MyDataset(Dataset):
         if (not inference_yaml) and n_total > n_decoy:
             # Trim to n_decoy, preserving class balance
             if near_idx and non_idx:
-                n_near = min(_MIN_PER_CLASS, len(near_idx))
-                n_non  = min(_MIN_PER_CLASS, len(non_idx))
+                n_near = min(_MIN_PER_CLASS, len(near_idx), max(1, n_decoy // 2))
+                n_non = min(_MIN_PER_CLASS, len(non_idx), n_decoy - n_near)
                 sel_near = rng.sample(near_idx, k=n_near)
                 sel_non  = rng.sample(non_idx,  k=n_non)
                 guaranteed = set(sel_near + sel_non)
@@ -1017,6 +1139,7 @@ class MyDataset(Dataset):
             else:
                 final_idx = rng.sample(range(n_total), k=n_decoy)
             rng.shuffle(final_idx)
+            final_idx = final_idx[:n_decoy]
             merged_graphs = [merged_graphs[i] for i in final_idx]
             merged_rmsds  = [merged_rmsds[i]  for i in final_idx]
             if merged_h3_lddt is not None:
@@ -1053,6 +1176,8 @@ class MyDataset(Dataset):
             )
         else:
             _logging.warning("_getitem_yaml: %s has no finite loop labels", pdb_id)
+
+        _log_data_profile(graph_set=graph_set, n_graphs=len(rmsd_tensor))
 
         if inference_yaml:
             ag_local_tensor = torch.tensor(merged_ag_local, dtype=torch.float32)

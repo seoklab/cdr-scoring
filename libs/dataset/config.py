@@ -106,6 +106,9 @@ class GraphBuildArgs:
         "H": [[26, 32], [52, 56], [95, 102]],
         "L": [[24, 34], [50, 56], [89, 97]],
     })
+    cdr_context_cutoff: float = 15.0
+    max_context_residues: int = 120
+    graph_crop_debug: bool = False
     on_the_fly: bool = True             # skip caching for target_model_pickle (preserves random_range)
 
 
@@ -159,6 +162,9 @@ class DatasetSpec:
     label_metric: str = "loop_rmsd"     # main scalar target; lower-is-better losses expect RMSD
     ranking_metric: str = "loop_rmsd"   # metric used for filtering/tier sampling
     min_diversity_threshold: int = 3     # min available sources to trigger diversity fill
+    profile_training: bool = False
+    profile_data_loading: bool = False
+    profile_log_interval: int = 20
     graph_build: GraphBuildArgs = field(default_factory=GraphBuildArgs)
     sources: Dict[str, SourceSpec] = field(default_factory=dict)
     # schedulable scalars
@@ -225,7 +231,10 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
             "H": [[26, 32], [52, 56], [95, 102]],
             "L": [[24, 34], [50, 56], [89, 97]],
         }),
-        on_the_fly=gb_raw.get("on_the_fly", False),
+        cdr_context_cutoff=float(gb_raw.get("cdr_context_cutoff", 15.0)),
+        max_context_residues=int(gb_raw.get("max_context_residues", 120)),
+        graph_crop_debug=bool(gb_raw.get("graph_crop_debug", False)),
+        on_the_fly=gb_raw.get("on_the_fly", True),
     )
 
     # sources
@@ -276,6 +285,9 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
         label_metric=raw.get("label_metric", "loop_rmsd"),
         ranking_metric=raw.get("ranking_metric", "loop_rmsd"),
         min_diversity_threshold=raw.get("min_diversity_threshold", 3),
+        profile_training=bool(raw.get("profile_training", False)),
+        profile_data_loading=bool(raw.get("profile_data_loading", False)),
+        profile_log_interval=int(raw.get("profile_log_interval", 20)),
         graph_build=graph_build,
         sources=sources,
         xtal_gate_prob=_maybe_schedule(raw.get("xtal_gate_prob", 0.0)),

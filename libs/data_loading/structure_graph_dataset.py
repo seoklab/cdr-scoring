@@ -357,7 +357,12 @@ class OnTheFlyStructureGraphDataset(Dataset):
             seed=sample.seed,
             model_idx=sample.sample,
         )
-        dic = create_dictionary_from_model(model_obj, use_all_atom=self.use_all_atom)
+        dic = create_dictionary_from_model(
+            model_obj,
+            use_all_atom=self.use_all_atom,
+            cdr_ranges=self.cdr_ranges,
+            target_id=sample.target_id or sample.sample_id,
+        )
         _apply_cdr_mask(dic, self.cdr_ranges)
         dic = build_edge_mask(dic, dist_cut_off=self.dist_cutoff)
         graph = build_graph(

@@ -47,6 +47,9 @@ def convert_and_cache(
     cdr_ranges=None,
     task_scope: str = "full_cdr",
     label_metric: str = "loop_rmsd",
+    cdr_context_cutoff: float = 15.0,
+    max_context_residues: int = 120,
+    graph_crop_debug: bool = False,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Load a Target pickle, generate graphs, and write cache.
 
@@ -85,6 +88,10 @@ def convert_and_cache(
                 cdr_ranges=cdr_ranges,
                 task_scope=task_scope,
                 label_metric=label_metric,
+                cdr_context_cutoff=cdr_context_cutoff,
+                max_context_residues=max_context_residues,
+                graph_crop_debug=graph_crop_debug,
+                target_id=pdb_id,
             )
 
             if not graphs:

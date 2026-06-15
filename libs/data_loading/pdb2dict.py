@@ -7,11 +7,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TypedDict
 
 import numpy as np
-import pandas as pd
+try:
+    import pandas as pd
+except ModuleNotFoundError:
+    pd = None
 from Bio.PDB import PDBParser, Structure
 from Bio.PDB.Atom import Atom
 from Bio.SVDSuperimposer import SVDSuperimposer
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ModuleNotFoundError:
+    def tqdm(iterable=None, *args, **kwargs):
+        return iterable if iterable is not None else []
 
 from evaluation.loop_metrics import compute_loop_metrics_from_structures
 
@@ -468,6 +475,8 @@ class Target:
             ]
             for csv_path in ranking_candidates:
                 if csv_path.exists():
+                    if pd is None:
+                        raise ModuleNotFoundError("pandas is required to read AF3 ranking CSV files")
                     df = pd.read_csv(csv_path)
                     required_cols = {"seed", "sample", "ranking_score"}
                     if required_cols.issubset(df.columns):
@@ -776,6 +785,8 @@ def main():
 
     # Generate and save dataframe
     if args.save_dataframe and results_data:
+        if pd is None:
+            raise ModuleNotFoundError("pandas is required to save result dataframes")
         df = pd.DataFrame(results_data)
         df_csv_path = args.output_root / f"{args.method}_results.csv"
         

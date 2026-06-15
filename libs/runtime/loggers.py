@@ -22,14 +22,22 @@
 # SPDX-License-Identifier: MIT
 
 import pathlib
+import json
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Dict, Any, Callable, Optional
 
-import dllogger
 import torch.distributed as dist
-import wandb
-from dllogger import Verbosity
+try:
+    import dllogger
+    from dllogger import Verbosity
+except ModuleNotFoundError:
+    dllogger = None
+    Verbosity = None
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 
 from runtime.utils import rank_zero_only
 
@@ -91,22 +99,33 @@ class LoggerCollection(Logger):
 class DLLogger(Logger):
     def __init__(self, save_dir: pathlib.Path, filename: str):
         super().__init__()
+        self.path = save_dir / filename
         if not dist.is_initialized() or dist.get_rank() == 0:
             save_dir.mkdir(parents=True, exist_ok=True)
-            dllogger.init(
-                backends=[dllogger.JSONStreamBackend(Verbosity.DEFAULT, str(save_dir / filename))])
+            if dllogger is not None:
+                dllogger.init(
+                    backends=[dllogger.JSONStreamBackend(Verbosity.DEFAULT, str(self.path))])
+            else:
+                self.path.write_text("")
 
     @rank_zero_only
     def log_hyperparams(self, params):
         params = self._sanitize_params(params)
-        dllogger.log(step="PARAMETER", data=params)
+        self._log(step="PARAMETER", data=params)
 
     @rank_zero_only
     def log_metrics(self, metrics, step=None):
         if step is None:
             step = tuple()
 
-        dllogger.log(step=step, data=metrics)
+        self._log(step=step, data=metrics)
+
+    def _log(self, step, data):
+        if dllogger is not None:
+            dllogger.log(step=step, data=data)
+            return
+        with self.path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps({"step": step, "data": data}, default=str) + "\n")
 
 
 class WandbLogger(Logger):
@@ -118,6 +137,8 @@ class WandbLogger(Logger):
             project: Optional[str] = None
     ):
         super().__init__()
+        if wandb is None:
+            raise ModuleNotFoundError("wandb is required when --wandb true")
         if not dist.is_initialized() or dist.get_rank() == 0:
             save_dir.mkdir(parents=True, exist_ok=True)
             self.experiment = wandb.init(name=name,

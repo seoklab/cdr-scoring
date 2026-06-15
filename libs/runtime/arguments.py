@@ -24,7 +24,6 @@
 import argparse
 import pathlib
 
-from model import Sujin_with_SE3 
 from runtime.utils import str2bool
 
 PARSER = argparse.ArgumentParser(description='SE(3)-Transformer')
@@ -108,6 +107,10 @@ PARSER.add_argument('--exclude_pdb_file', type=str, default=None,
                     help='Path to newline-delimited PDB IDs to exclude from train/valid lists')
 PARSER.add_argument('--run_script', type=str, default=None,
                     help='Path to the shell script that launched this run (saved to wandb for reproducibility)')
+PARSER.add_argument('--profile_training', type=str2bool, nargs='?', const=True, default=False,
+                    help='Log lightweight averaged training step timings')
+PARSER.add_argument('--profile_log_interval', type=int, default=20,
+                    help='Profiler logging interval in steps when --profile_training is enabled')
 
 # ── Tier-based DPO losses (step 2) ──
 PARSER.add_argument('--use_tier_dpo', action='store_true', default=False,
@@ -156,4 +159,22 @@ PARSER.add_argument('--lambda_aux_ord', type=float, default=0.1,
 PARSER.add_argument('--lambda_mono', type=float, default=0.01,
                     help='Weight for monotonic probability penalty')
 
-Sujin_with_SE3.add_argparse_args(PARSER)
+model = PARSER.add_argument_group("Model architecture")
+model.add_argument('--num_layers', type=int, default=4,
+                   help='Number of stacked Transformer layers')
+model.add_argument('--num_heads', type=int, default=4,
+                   help='Number of heads in self-attention')
+model.add_argument('--channels_div', type=int, default=2,
+                   help='Channels division before feeding to attention layer')
+model.add_argument('--pooling', type=str, default=None, const=None, nargs='?', choices=['max', 'avg'],
+                   help='Type of graph pooling')
+model.add_argument('--norm', type=str2bool, nargs='?', const=True, default=True,
+                   help='Apply a normalization layer after each attention block')
+model.add_argument('--use_layer_norm', type=str2bool, nargs='?', const=True, default=True,
+                   help='Apply layer normalization between MLP layers')
+model.add_argument('--low_memory', type=str2bool, nargs='?', const=True, default=False,
+                   help='If true, use lower-memory fused ops where supported')
+model.add_argument('--num_degrees',
+                   help='Number of degrees to use. Hidden features will have types [0, ..., num_degrees - 1]',
+                   type=int, default=2)
+model.add_argument('--num_channels', help='Number of channels for the hidden features', type=int, default=32)
