@@ -272,6 +272,7 @@ class MyDataset(Dataset):
         self._ds_spec = None
         self._registry = None
         self._epoch = 1
+        self._metric_store = None
         if dataset_config is not None:
             _ensure_dataset_pkg()
             from dataset.config import load_dataset_spec
@@ -279,6 +280,18 @@ class MyDataset(Dataset):
             self._ds_spec = load_dataset_spec(dataset_config)
             self._registry = SourceRegistry(self._ds_spec)
             _logging.info('MyDataset: YAML config loaded from %s', dataset_config)
+            pm = getattr(self._ds_spec, 'precomputed_metrics', None)
+            if pm is not None and pm.enabled:
+                from dataset.precomputed_metrics import PrecomputedMetricStore
+                self._metric_store = PrecomputedMetricStore(
+                    root=pm.root,
+                    source_subdirs=pm.sources,
+                    metrics_filename=pm.metrics_filename,
+                )
+                _logging.info(
+                    'MyDataset: precomputed metrics enabled (root=%s, require=%s)',
+                    pm.root, pm.require,
+                )
 
     def set_epoch(self, epoch: int):
         """Called at the start of each epoch so schedulable params update."""
@@ -706,6 +719,47 @@ class MyDataset(Dataset):
     # ──────────────────────────────────────────────────────────────
     # YAML-exclusive loading path  (replaces hardcoded logic)
     # ──────────────────────────────────────────────────────────────
+    def _labels_for_models(self, target_obj, spec, source_name, resolved_pdb_id):
+        """Return per-model loop labels (training targets) for *target_obj*.
+
+        When a precomputed-metric store is configured and has data for
+        *source_name*, labels are looked up from the parquet by decoy identity
+        ``(target_id, seed, sample)`` instead of being recomputed from
+        structures.  Falls back to on-the-fly computation when:
+          - no store is configured, or
+          - the source has no precomputed parquet, or
+          - the store is in non-require mode and a decoy lookup misses.
+        """
+        models = target_obj.models
+        store = self._metric_store
+        if store is None or not store.has_source(source_name):
+            return [_model_loop_label_from_target(m, target_obj, spec) for m in models]
+
+        from dataset.precomputed_metrics import decoy_identity_for_lookup, metric_column
+
+        pm = getattr(spec, "precomputed_metrics", None)
+        require = bool(pm.require) if pm is not None else True
+        column = metric_column(
+            getattr(spec, "label_metric", "loop_rmsd"),
+            getattr(spec, "task_scope", "full_cdr"),
+        )
+
+        labels = []
+        n_found = 0
+        for pos, model in enumerate(models):
+            seed, sample = decoy_identity_for_lookup(model, pos)
+            value = store.lookup(source_name, resolved_pdb_id, seed, sample, column)
+            if value == value:  # finite
+                n_found += 1
+            elif not require:
+                value = _model_loop_label_from_target(model, target_obj, spec)
+            labels.append(value)
+        _logging.info(
+            "_getitem_yaml: precomputed labels %s/%s found=%d/%d column=%s",
+            source_name, resolved_pdb_id, n_found, len(models), column,
+        )
+        return labels
+
     @staticmethod
     def _read_rmsd_only(rmsd_path):
         """Load only RMSD values from a pickle file (lightweight, no graph loading)."""
@@ -837,7 +891,9 @@ class MyDataset(Dataset):
                     try:
                         target_obj = _load_target_for_getitem(cand.target_model_path)
                         t_metric = time.perf_counter()
-                        all_rmsds = [_model_loop_label_from_target(m, target_obj, spec) for m in target_obj.models]
+                        all_rmsds = self._labels_for_models(
+                            target_obj, spec, sname, cand.pdb_id,
+                        )
                         ag_local_full = [_ag_local_from_model(m) for m in target_obj.models]
                         _profile_add("metric_lookup_time", time.perf_counter() - t_metric)
                         target_pickle_path = cand.target_model_path
@@ -888,6 +944,19 @@ class MyDataset(Dataset):
                 ag_local_full = [float("nan")] * len(all_rmsds)
 
             valid_indices = list(range(len(all_rmsds)))
+
+            # Drop decoys with no usable label (NaN). This is required when
+            # precomputed metrics are used (a missing parquet row → NaN label),
+            # and is harmless otherwise (NaN labels are unusable for training).
+            if self._metric_store is not None:
+                n_before = len(valid_indices)
+                valid_indices = [i for i in valid_indices if all_rmsds[i] == all_rmsds[i]]
+                n_dropped = n_before - len(valid_indices)
+                if n_dropped:
+                    _logging.warning(
+                        "_getitem_yaml: %s/%s dropped %d/%d decoys without precomputed metric",
+                        sname, pdb_id, n_dropped, n_before,
+                    )
 
             # Training/validation: RMSD range filter.
             # Inference: keep all decoys (filters are for offline analysis only).

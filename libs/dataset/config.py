@@ -125,6 +125,29 @@ class RmsdFilterSpec:
 
 
 @dataclass
+class PrecomputedMetricsSpec:
+    """Use precomputed loop-metric parquet files instead of on-the-fly metric
+    computation during training.
+
+    YAML example::
+
+        precomputed_metrics:
+          enabled: true
+          root: /home/sujin/projects/cdr-scoring/cdr-data/metrics_precomputed
+          require: true          # drop decoys with no precomputed metric (no fallback)
+          metrics_filename: metrics/loop_metrics.parquet
+          sources:               # optional source_name -> subdir override
+            Boltz2: Boltz2
+            ComMat: ComMat
+    """
+    enabled: bool = False
+    root: str = ""
+    require: bool = True
+    metrics_filename: str = "metrics/loop_metrics.parquet"
+    sources: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class PdbIdMapping:
     """Bidirectional old <-> new PDB ID mapping.
 
@@ -186,6 +209,8 @@ class DatasetSpec:
     # PDB ID mapping for old <-> new format conversion
     pdb_id_mapping_path: str = ""           # path to info.pkl
     pdb_id_mapping: Optional[PdbIdMapping] = field(default=None, repr=False)
+    # Precomputed per-decoy metrics (skip on-the-fly loop metric computation)
+    precomputed_metrics: Optional[PrecomputedMetricsSpec] = None
 
     # ── convenience helpers ──
     def effective_xtal_prob(self, epoch: int) -> float:
@@ -265,6 +290,18 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
             max_rmsd=float(rf_raw.get("max_rmsd", float('inf'))),
         )
 
+    # precomputed_metrics
+    pm_raw = raw.get("precomputed_metrics", None)
+    precomputed_metrics = None
+    if pm_raw and pm_raw.get("enabled", False):
+        precomputed_metrics = PrecomputedMetricsSpec(
+            enabled=True,
+            root=pm_raw.get("root", ""),
+            require=bool(pm_raw.get("require", True)),
+            metrics_filename=pm_raw.get("metrics_filename", "metrics/loop_metrics.parquet"),
+            sources={str(k): str(v) for k, v in (pm_raw.get("sources", {}) or {}).items()},
+        )
+
     # "all" (string) or null → None → use entire list without subsampling
     _raw_gp = raw.get("num_gp", None)
     _raw_abag = raw.get("num_abag", None)
@@ -304,6 +341,7 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
         num_valid_abag=_num_valid_abag,
         rmsd_filter=rmsd_filter,
         pdb_id_mapping_path=raw.get("pdb_id_mapping", ""),
+        precomputed_metrics=precomputed_metrics,
     )
     # Load PDB ID mapping if path provided
     if spec.pdb_id_mapping_path:

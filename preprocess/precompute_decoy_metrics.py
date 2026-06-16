@@ -752,6 +752,18 @@ def _write_parquet(rows: List[dict], path: Path, overwrite: bool, columns: Optio
     frame.to_parquet(path, index=False)
 
 
+def _dedupe_rows(rows: List[dict], key_columns: Sequence[str]) -> List[dict]:
+    seen = set()
+    deduped = []
+    for row in rows:
+        key = tuple(row.get(col) for col in key_columns)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
 def _ensure_parquet_engine():
     try:
         import pyarrow  # noqa: F401
@@ -1015,6 +1027,11 @@ def run(args):
 
         source_dir = output_dir / source
         if not args.dry_run:
+            target_rows = _dedupe_rows(target_rows, ["target_id", "source"])
+            decoy_key = ["target_id", "source", "seed", "sample"]
+            loop_rows = _dedupe_rows(loop_rows, decoy_key)
+            interface_rows = _dedupe_rows(interface_rows, decoy_key)
+            dockq_rows = _dedupe_rows(dockq_rows, decoy_key)
             _write_parquet(target_rows, source_dir / "targets" / "target_metrics.parquet", args.overwrite, TARGET_COLUMNS)
             if compute_loop:
                 _write_parquet(loop_rows, source_dir / "metrics" / "loop_metrics.parquet", args.overwrite, LOOP_COLUMNS)
