@@ -288,7 +288,7 @@ class MyDataset(Dataset):
                     source_subdirs=pm.sources,
                     metrics_filename=pm.metrics_filename,
                 )
-                _logging.info(
+                _logging.debug(
                     'MyDataset: precomputed metrics enabled (root=%s, require=%s)',
                     pm.root, pm.require,
                 )
@@ -754,7 +754,7 @@ class MyDataset(Dataset):
             elif not require:
                 value = _model_loop_label_from_target(model, target_obj, spec)
             labels.append(value)
-        _logging.info(
+        _logging.debug(
             "_getitem_yaml: precomputed labels %s/%s found=%d/%d column=%s",
             source_name, resolved_pdb_id, n_found, len(models), column,
         )
@@ -777,7 +777,7 @@ class MyDataset(Dataset):
         except Exception:
             return []
 
-    def _getitem_yaml(self, pdb_id):
+    def _getitem_yaml(self, pdb_id, _depth=0):
         """YAML-exclusive loading: RMSD-first → filter → mix → load selected graphs.
 
         When dataset_config (YAML) is set, this method replaces ALL hardcoded
@@ -973,10 +973,25 @@ class MyDataset(Dataset):
                 per_source[sname] = (graph_path, all_rmsds, valid_indices, target_pickle_path, ag_local_full)
 
         if not per_source:
-            raise FileNotFoundError(
-                f"No loadable decoys for {pdb_id}"
-                + ("" if inference_yaml else " after RMSD/quality filtering")
-            )
+            if self._metric_store is not None:
+                reason = "no precomputed metric rows for this target (require=true)"
+            elif inference_yaml:
+                reason = "no decoys available"
+            elif spec.rmsd_filter is not None:
+                reason = "no decoys left after RMSD filtering"
+            else:
+                reason = "no decoys available"
+            # In training/validation, skip this target and try another one rather
+            # than crashing the whole run (targets missing from the precomputed
+            # parquet, etc.). Bounded retry guards against infinite recursion.
+            if not inference_yaml and len(self.inp_dat) > 1 and _depth < 50:
+                _logging.warning(
+                    "_getitem_yaml: %s -> %s; skipping to another target (retry %d)",
+                    pdb_id, reason, _depth + 1,
+                )
+                alt_idx = random.randint(0, len(self.inp_dat) - 1)
+                return self._getitem_yaml(self.inp_dat[alt_idx], _depth + 1)
+            raise FileNotFoundError(f"No loadable decoys for {pdb_id} ({reason})")
 
         # ── Phase 2: Select decoys to materialize ──
         # Training/validation keeps the existing tier-based sampler.
@@ -1223,8 +1238,10 @@ class MyDataset(Dataset):
                 "skipping this target: %s", pdb_id, e,
             )
             del merged_graphs, merged_rmsds
-            alt_idx = random.randint(0, len(self.inp_dat) - 1)
-            return self.__getitem__(alt_idx)
+            if len(self.inp_dat) > 1 and _depth < 50:
+                alt_idx = random.randint(0, len(self.inp_dat) - 1)
+                return self._getitem_yaml(self.inp_dat[alt_idx], _depth + 1)
+            raise
         del merged_graphs
         rmsd_tensor = torch.tensor(merged_rmsds, dtype=torch.float32)
         del merged_rmsds

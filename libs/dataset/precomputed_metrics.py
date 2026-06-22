@@ -30,6 +30,11 @@ from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache of parsed parquet tables, keyed by absolute parquet path.
+# train.py rebuilds MyDataset (and thus the store) every epoch; caching here
+# avoids re-reading/re-parsing the (large) parquet files on each epoch.
+_TABLE_CACHE: Dict[str, Dict[Tuple[str, Optional[int], int], Dict[str, float]]] = {}
+
 
 # ──────────────────────────────────────────────────────────────
 # label_metric (training name) → parquet column
@@ -165,6 +170,13 @@ class PrecomputedMetricStore:
             return
         self._loaded[source_name] = True
         path = self._parquet_path(source_name)
+
+        # Reuse a previously parsed table for this parquet (across epochs).
+        cached = _TABLE_CACHE.get(path)
+        if cached is not None:
+            self._tables[source_name] = cached
+            return
+
         if not os.path.exists(path):
             logger.warning("PrecomputedMetricStore: parquet not found for source=%s (%s)", source_name, path)
             return
@@ -197,7 +209,8 @@ class PrecomputedMetricStore:
                     values[col] = float("nan")
             table[(target_id, seed, sample)] = values
         self._tables[source_name] = table
-        logger.info(
+        _TABLE_CACHE[path] = table
+        logger.debug(
             "PrecomputedMetricStore: loaded source=%s rows=%d targets=%d from %s",
             source_name, len(table), df["target_id"].nunique() if "target_id" in df else -1, path,
         )
