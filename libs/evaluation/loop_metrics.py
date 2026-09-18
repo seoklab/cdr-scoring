@@ -355,22 +355,13 @@ def _backbone_lddt(
         preserved += (diff < thr).astype(np.float64)
     preserved /= len(LDDT_THRESHOLDS_A)
 
-    residue_scores = []
-    score_res_ids = atom_to_res[score_idx]
-    for res_id in np.unique(score_res_ids):
-        row_mask = score_res_ids == res_id
-        atom_scores = []
-        for local_idx, is_match in enumerate(row_mask):
-            if not is_match:
-                continue
-            nbr = neighbor_rows[local_idx]
-            if nbr.any():
-                atom_scores.append(float(preserved[local_idx, nbr].mean()))
-        if atom_scores:
-            residue_scores.append(float(np.mean(atom_scores)))
-    if not residue_scores:
+    # Micro-average (canonical global lDDT): every preserved distance counts
+    # equally, i.e. total preserved distances / total considered distances,
+    # rather than averaging per-atom then per-residue (macro-average).
+    total_pairs = int(neighbor_rows.sum())
+    if total_pairs == 0:
         return float("nan")
-    return float(np.mean(residue_scores))
+    return float(preserved[neighbor_rows].sum() / total_pairs)
 
 
 def _pairwise_distances(points: np.ndarray) -> np.ndarray:

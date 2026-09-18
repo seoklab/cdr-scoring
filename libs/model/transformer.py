@@ -213,8 +213,14 @@ class Sujin_with_SE3(nn.Module):
         self.readout='mean'
         self.mp_layers = torch.nn.ModuleList()
         #
-        self.linear_out_1 = nn.Linear(fiber_out[0], 1, bias=False)
-        self.ord_head = nn.Linear(fiber_out[0], 3, bias=True)
+        self.linear_out_1 = nn.Linear(fiber_out[0], 1, bias=False)  # intrinsic loop-quality head
+        self.ord_head = nn.Linear(fiber_out[0], 3, bias=True)       # H3 ordinal head
+        # v2 multi-head (shared pooled embedding):
+        #   interface_head : interface-compatibility scalar (defined now; inactive in
+        #                    v2 pretrain — label = GP loop lDDT / holo DockQ, wired later)
+        #   final_head     : Phase-C antibody ranking score (trained in DPO finetune)
+        self.interface_head = nn.Linear(fiber_out[0], 1, bias=False)
+        self.final_head = nn.Linear(fiber_out[0], 1, bias=False)
         #
         self.num_layers = num_layers
         self.act_fn=nn.ReLU()
@@ -291,8 +297,16 @@ class Sujin_with_SE3(nn.Module):
             batched_graph.ndata['out_l0']=feats['0'].squeeze(-1)
             out_dic = {}
             out = dgl.readout_nodes(batched_graph, 'out_l0', op=self.readout)
-            out_dic['out'] = self.linear_out_1(out).squeeze(-1)
+            out_dic['out'] = self.linear_out_1(out).squeeze(-1)     # intrinsic (== pretrain ranking score)
             out_dic['ord_logits'] = self.ord_head(out)
+            # v2 heads (shared pooled embedding `out`). `out`/intrinsic drive the
+            # pretrain SML; interface/final are emitted for downstream phases.
+            out_dic['intrinsic'] = out_dic['out']
+            # pooled backbone embedding, before any head. Additive only -- used by
+            # analyze/probe_backbone_fnat.py to test what the trunk still encodes.
+            out_dic['embed'] = out
+            out_dic['interface'] = self.interface_head(out).squeeze(-1)
+            out_dic['final'] = self.final_head(out).squeeze(-1)
             if self.use_nodewise_score:
                 node = batched_graph.ndata['out_l0']
                 score = self.linear_out_1(node).squeeze(-1)
@@ -381,8 +395,11 @@ class Sujin_with_SE3_allatom(nn.Module):
         self.readout='mean'
         self.mp_layers = torch.nn.ModuleList()
         #
-        self.linear_out_1 = nn.Linear(fiber_out[0], 1, bias=False)
-        self.ord_head = nn.Linear(fiber_out[0], 3, bias=True)
+        self.linear_out_1 = nn.Linear(fiber_out[0], 1, bias=False)  # intrinsic loop-quality head
+        self.ord_head = nn.Linear(fiber_out[0], 3, bias=True)       # H3 ordinal head
+        # v2 multi-head (shared pooled embedding); see Sujin_with_SE3 for semantics.
+        self.interface_head = nn.Linear(fiber_out[0], 1, bias=False)
+        self.final_head = nn.Linear(fiber_out[0], 1, bias=False)
         #
         self.num_layers = num_layers
         self.act_fn=nn.ReLU()
@@ -472,6 +489,10 @@ class Sujin_with_SE3_allatom(nn.Module):
         out_dic={}
         out_dic['out']=self.linear_out_1(out).squeeze(-1)
         out_dic['ord_logits'] = self.ord_head(out)
+        out_dic['intrinsic'] = out_dic['out']
+        out_dic['embed'] = out          # pooled backbone embedding, before any head
+        out_dic['interface'] = self.interface_head(out).squeeze(-1)
+        out_dic['final'] = self.final_head(out).squeeze(-1)
         #out_dic['out_cee']=out_cee
         #out_dic['out_sml']=out_sml
         return out_dic

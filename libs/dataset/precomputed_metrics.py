@@ -12,7 +12,7 @@ live under one directory per source, e.g.::
     {root}/ComMat/metrics/loop_metrics.parquet
 
 Each row carries the decoy identity columns ``target_id, source, seed, sample``
-and the loop metric columns ``global_loop_rmsd, global_loop_lddt,
+and the loop metric columns ``cdr_rmsd, cdr_lddt,
 H3_loop_rmsd, H3_loop_lddt, ...``.
 
 The decoy identity used as the join key is derived **exactly** the same way the
@@ -40,12 +40,14 @@ _TABLE_CACHE: Dict[str, Dict[Tuple[str, Optional[int], int], Dict[str, float]]] 
 # label_metric (training name) → parquet column
 # ──────────────────────────────────────────────────────────────
 _METRIC_COLUMN = {
-    "loop_rmsd": "global_loop_rmsd",
-    "loop_lddt": "global_loop_lddt",
-    "full_cdr_loop_rmsd": "global_loop_rmsd",
-    "full_cdr_loop_lddt": "global_loop_lddt",
+    "loop_rmsd": "cdr_rmsd",
+    "loop_lddt": "cdr_lddt",
+    "full_cdr_loop_rmsd": "cdr_rmsd",
+    "full_cdr_loop_lddt": "cdr_lddt",
     "h3_rmsd": "H3_loop_rmsd",
     "h3_lddt": "H3_loop_lddt",
+    "dockq": "dockq",   # validation-only (CAPRI classification of the top-1 decoy)
+    "fnat": "fnat",     # interface head label (native antibody-antigen contact fraction)
 }
 
 
@@ -191,7 +193,12 @@ class PrecomputedMetricStore:
             logger.exception("PrecomputedMetricStore: failed to read parquet %s", path)
             return
 
-        metric_cols = [c for c in df.columns if c.endswith("_loop_rmsd") or c.endswith("_loop_lddt")]
+        # Global loop columns were renamed cdr_rmsd/cdr_lddt (antigen-aware); the
+        # per-CDR columns still end in _loop_rmsd/_loop_lddt.
+        metric_cols = [
+            c for c in df.columns
+            if c.endswith("_loop_rmsd") or c.endswith("_loop_lddt") or c in ("cdr_rmsd", "cdr_lddt")
+        ]
         table: Dict[Tuple[str, Optional[int], int], Dict[str, float]] = {}
         for row in df.itertuples(index=False):
             d = row._asdict()
@@ -208,6 +215,50 @@ class PrecomputedMetricStore:
                 except (TypeError, ValueError):
                     values[col] = float("nan")
             table[(target_id, seed, sample)] = values
+
+        # Merge DockQ (validation-only) from the sibling dockq parquet, keyed by
+        # the same (target_id, seed, sample) identity. Optional: absent for
+        # sources/targets without an antigen (apo) -> stays NaN.
+        dockq_path = path.replace("loop_metrics.parquet", "dockq_metrics.parquet")
+        if dockq_path != path and os.path.exists(dockq_path):
+            try:
+                ddf = pd.read_parquet(dockq_path, columns=["target_id", "seed", "sample", "dockq"])
+                for row in ddf.itertuples(index=False):
+                    d = row._asdict()
+                    try:
+                        key = (str(d["target_id"]), _norm_seed(d.get("seed")), int(d["sample"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if key in table:
+                        try:
+                            table[key]["dockq"] = float(d["dockq"])
+                        except (TypeError, ValueError):
+                            table[key]["dockq"] = float("nan")
+            except Exception:
+                logger.exception("PrecomputedMetricStore: failed to read dockq parquet %s", dockq_path)
+
+        # Merge fnat (interface-head label = native antibody-antigen contact
+        # fraction) from the sibling interface parquet, same identity key. Absent
+        # for apo targets / sources without an antigen (e.g. GP) -> stays NaN, so
+        # the interface loss masks those decoys automatically.
+        iface_path = path.replace("loop_metrics.parquet", "interface_metrics.parquet")
+        if iface_path != path and os.path.exists(iface_path):
+            try:
+                idf = pd.read_parquet(iface_path, columns=["target_id", "seed", "sample", "fnat"])
+                for row in idf.itertuples(index=False):
+                    d = row._asdict()
+                    try:
+                        key = (str(d["target_id"]), _norm_seed(d.get("seed")), int(d["sample"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if key in table:
+                        try:
+                            table[key]["fnat"] = float(d["fnat"])
+                        except (TypeError, ValueError):
+                            table[key]["fnat"] = float("nan")
+            except Exception:
+                logger.exception("PrecomputedMetricStore: failed to read interface parquet %s", iface_path)
+
         self._tables[source_name] = table
         _TABLE_CACHE[path] = table
         logger.debug(

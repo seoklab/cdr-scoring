@@ -171,9 +171,23 @@ def aggregate_top1_h3_val_metrics(epoch_loss, list_keys=None):
 
 
 def reduce_epoch_loss(epoch_loss,world_size):
-    for loss_key in epoch_loss.keys():
-        torch.distributed.all_reduce(epoch_loss[loss_key])
-        epoch_loss[loss_key]=(epoch_loss[loss_key]/world_size)
+    # Only all-reduce keys present on EVERY rank, iterated in a deterministic
+    # (sorted) order. Some validation keys are emitted conditionally (e.g.
+    # holo-only CAPRI / finite-only H3), so ranks can hold different keysets;
+    # reducing per-rank key order would mismatch the collective and deadlock.
+    import torch.distributed as dist
+    local_keys = set(epoch_loss.keys())
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, local_keys)
+    common = set(gathered[0])
+    for g in gathered[1:]:
+        common &= set(g)
+    for loss_key in sorted(common):
+        v = epoch_loss[loss_key]
+        if not isinstance(v, torch.Tensor):
+            v = torch.tensor(float(v), device='cuda')
+        dist.all_reduce(v)
+        epoch_loss[loss_key] = v / world_size
     return epoch_loss
 
 

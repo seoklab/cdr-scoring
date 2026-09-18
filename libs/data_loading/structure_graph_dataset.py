@@ -303,6 +303,14 @@ def _parse_structure(path: Path):
 
 def _apply_cdr_mask(dic: dict, cdr_ranges: Sequence[CDRRange]) -> None:
     if not cdr_ranges:
+        # Still emit `loop_id` (all zeros = no CDR), because the OTHER graph
+        # builder (graph_generation_from_target) always emits it. Returning early
+        # left this path's graphs without the field, and `dgl.batch` refuses to
+        # merge graphs whose ndata schemas differ — so any target mixing a
+        # graph_pickle source with a target_model_pickle source raised
+        # "Expect all graphs to have the same schema on nodes[_N].data" and was
+        # silently DROPPED from the epoch (~21 targets/epoch observed).
+        dic["loop_id"] = torch.zeros_like(dic["ulr_mask"], dtype=torch.int64)
         return
     chain_ids = dic["chain_id"]
     res_no = dic["res_no"]

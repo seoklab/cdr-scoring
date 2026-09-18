@@ -12,11 +12,22 @@ Key classes
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+
+
+def metric_higher_is_better(metric_name: str) -> bool:
+    """True when larger values are better (lDDT-family), False for RMSD-family."""
+    return "lddt" in str(metric_name).lower()
+
+
+def default_near_native_cutoff(metric_name: str) -> float:
+    """Default near-native vs non-native cutoff for a given label metric."""
+    return 0.8 if metric_higher_is_better(metric_name) else 2.0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -84,6 +95,9 @@ class SourceSpec:
     metrics_template: str = ""               # for Boltz2 ag_local_rmsd csv/json
     metrics_format: str = "csv"              # "csv" | "json"
     pdb_id_type: str = "old"                 # "old" | "new" — which PDB ID namespace this source uses
+    domain: str = "antibody"                 # "antibody" | "general_protein" — decoy provenance for
+                                             # v2 per-head source-typing (GP=general_protein; else antibody,
+                                             # apo/holo distinguished by finite DockQ at decoy level).
 
     def effective_weight(self, epoch: int) -> float:
         if isinstance(self.weight, ScheduleSpec):
@@ -182,8 +196,9 @@ class DatasetSpec:
     seed: int = 42
     n_decoy: int = 64                   # total decoys per target returned to model
     task_scope: str = "full_cdr"        # "full_cdr" (M0) or legacy "h3"
-    label_metric: str = "loop_rmsd"     # main scalar target; lower-is-better losses expect RMSD
+    label_metric: str = "loop_rmsd"     # main scalar target; loop_rmsd=lower-better, loop_lddt=higher-better
     ranking_metric: str = "loop_rmsd"   # metric used for filtering/tier sampling
+    near_native_cutoff: Optional[float] = None  # None -> metric-dependent default (2.0 rmsd / 0.8 lddt)
     min_diversity_threshold: int = 3     # min available sources to trigger diversity fill
     profile_training: bool = False
     profile_data_loading: bool = False
@@ -211,6 +226,16 @@ class DatasetSpec:
     pdb_id_mapping: Optional[PdbIdMapping] = field(default=None, repr=False)
     # Precomputed per-decoy metrics (skip on-the-fly loop metric computation)
     precomputed_metrics: Optional[PrecomputedMetricsSpec] = None
+    # v1 DockQ gate: during TRAINING, keep only holo decoys with DockQ >= this
+    # value (apo decoys, i.e. NaN DockQ, are always kept). None disables the gate.
+    # Validation is never gated (top-1 CAPRI must see the full decoy pool).
+    dockq_gate: Optional[float] = None
+    # exp8 fnat gate: keep only holo decoys with fnat > this value (apo/GP, i.e.
+    # NaN fnat, are always kept). None disables it. Same rule the exp8 SML applies
+    # in the loss, moved into candidate selection so unusable poses are never
+    # loaded, and so the training pool matches the fnat>0.5-gated validation
+    # manifests. Strict >, matching the project-wide "fnat>0.5" filter.
+    fnat_gate: Optional[float] = None
 
     # ── convenience helpers ──
     def effective_xtal_prob(self, epoch: int) -> float:
@@ -225,6 +250,16 @@ class DatasetSpec:
 
     def enabled_sources(self) -> Dict[str, SourceSpec]:
         return {k: v for k, v in self.sources.items() if v.enabled}
+
+    def label_higher_is_better(self) -> bool:
+        """True when the label metric is higher-is-better (lDDT-family)."""
+        return metric_higher_is_better(self.label_metric)
+
+    def effective_near_native_cutoff(self) -> float:
+        """Cutoff separating near-native from non-native for SML / tier sampling."""
+        if self.near_native_cutoff is not None:
+            return float(self.near_native_cutoff)
+        return default_near_native_cutoff(self.label_metric)
 
     def resolve_pdb_id(self, pdb_id: str, target_type: str) -> str:
         """Convert *pdb_id* to old / new format as needed by *target_type*."""
@@ -279,6 +314,7 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
             metrics_template=src_raw.get("metrics_template", ""),
             metrics_format=src_raw.get("metrics_format", "csv"),
             pdb_id_type=src_raw.get("pdb_id_type", "old"),
+            domain=src_raw.get("domain", "antibody"),
         )
 
     # rmsd_filter
@@ -321,6 +357,7 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
         task_scope=raw.get("task_scope", "full_cdr"),
         label_metric=raw.get("label_metric", "loop_rmsd"),
         ranking_metric=raw.get("ranking_metric", "loop_rmsd"),
+        near_native_cutoff=raw.get("near_native_cutoff", None),
         min_diversity_threshold=raw.get("min_diversity_threshold", 3),
         profile_training=bool(raw.get("profile_training", False)),
         profile_data_loading=bool(raw.get("profile_data_loading", False)),
@@ -342,7 +379,24 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
         rmsd_filter=rmsd_filter,
         pdb_id_mapping_path=raw.get("pdb_id_mapping", ""),
         precomputed_metrics=precomputed_metrics,
+        dockq_gate=(None if raw.get("dockq_gate", None) is None else float(raw.get("dockq_gate"))),
+        fnat_gate=(None if raw.get("fnat_gate", None) is None else float(raw.get("fnat_gate"))),
     )
+    # ── CLI overrides via environment (set by train.py from argparser) ──
+    # This keeps a single source of truth: both train.py's spec and the
+    # dataset's internally-loaded spec honor --label_metric / --near_native_cutoff.
+    _env_label = os.environ.get("CDR_LABEL_METRIC")
+    if _env_label:
+        spec.label_metric = _env_label
+        # Full-lDDT mode: ranking/tier logic follows the same metric as the label.
+        spec.ranking_metric = _env_label
+    _env_cutoff = os.environ.get("CDR_NEAR_NATIVE_CUTOFF")
+    if _env_cutoff not in (None, ""):
+        try:
+            spec.near_native_cutoff = float(_env_cutoff)
+        except ValueError:
+            pass
+
     # Load PDB ID mapping if path provided
     if spec.pdb_id_mapping_path:
         spec.pdb_id_mapping = PdbIdMapping.from_info_pkl(spec.pdb_id_mapping_path)

@@ -106,17 +106,39 @@ def sample_mix(
                 selected, remaining, w_names, w_vals, w_caps, rng
             )
 
-    # Guarantee at least 1 decoy from Xtal when available (so xtal is always included)
+    # Crystal (xtal) inclusion is probability-gated and annealed over training via
+    # spec.xtal_gate_prob (a ScheduleSpec resolved at this epoch). Early epochs keep
+    # the native crystal as a positive anchor (prob ~1.0); late epochs drop it (prob
+    # ~0.0) so the model must discriminate among model-generated decoys.
     xtal_key = next((k for k in avail if k.lower() == "xtal"), None)
-    if xtal_key is not None and selected.get(xtal_key, 0) == 0 and sum(selected.values()) >= 1:
-        # Take 1 from a non-xtal source that has at least 1 and give it to Xtal
-        donor = next(
-            (k for k, v in selected.items() if k.lower() != "xtal" and v >= 1),
-            None,
-        )
-        if donor is not None:
-            selected[donor] = selected[donor] - 1
-            selected[xtal_key] = 1
+    if xtal_key is not None:
+        xtal_prob = spec.effective_xtal_prob(epoch)
+        include_xtal = rng.random() < xtal_prob
+        if include_xtal:
+            # Ensure exactly one crystal decoy is present (donate a slot if needed).
+            if selected.get(xtal_key, 0) == 0 and sum(selected.values()) >= 1:
+                donor = next(
+                    (k for k, v in selected.items() if k.lower() != "xtal" and v >= 1),
+                    None,
+                )
+                if donor is not None:
+                    selected[donor] = selected[donor] - 1
+                    selected[xtal_key] = 1
+        else:
+            # Drop any crystal picked by the diversity/weighted fill and hand its
+            # slot(s) back to the largest-capacity non-xtal source.
+            freed = selected.get(xtal_key, 0)
+            if freed > 0:
+                selected[xtal_key] = 0
+                donor = max(
+                    (k for k in selected if k.lower() != "xtal"),
+                    key=lambda k: avail.get(k, 0) - selected.get(k, 0),
+                    default=None,
+                )
+                if donor is not None:
+                    add = min(freed, avail.get(donor, 0) - selected.get(donor, 0))
+                    if add > 0:
+                        selected[donor] = selected.get(donor, 0) + add
 
     # ensure total does not exceed available
     total_avail = sum(avail.values())

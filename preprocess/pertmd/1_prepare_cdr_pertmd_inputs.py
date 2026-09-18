@@ -22,10 +22,11 @@ BASE_DIR = Path("/home/sujin/DB/h3-loop-modeling/ab_ag/1_tr_abag")
 DEFAULT_SOURCE_DIR = BASE_DIR / "00_crystal"
 DEFAULT_FASTA_ROOT = BASE_DIR / "21_commat_xtal"
 DEFAULT_INFO_DIR = BASE_DIR / "0_info"
-DEFAULT_OUTPUT_DIR = BASE_DIR / "41_pertmd_cdr_input"
+DEFAULT_OUTPUT_DIR_CDR = BASE_DIR / "41_pertmd_cdr_input"
+DEFAULT_OUTPUT_DIR_ALL = BASE_DIR / "42_pertmd_all_input"
 DEFAULT_GALAXY_REFINE = Path("/home/sujin/archive/loop/GalaxyRefine_multi.py")
 DEFAULT_SCHEDULE = Path("/home/sujin/archive/loop/sch_t500_c300")
-DEFAULT_SLURM_NODELIST = "star[005-018,35-42]" #star[001-018,020,024,026,028-029,031,033,036,040]
+DEFAULT_SLURM_NODELIST = "star0[01-18,20,26,28-29,33,36,40]" #star[001-018,020,024,026,028-029,031,033,036,040]
 CDR_RANGES = {
     "H1": ("H", 26, 32),
     "H2": ("H", 52, 56),
@@ -74,7 +75,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE_DIR)
     parser.add_argument("--fasta-root", type=Path, default=DEFAULT_FASTA_ROOT)
     parser.add_argument("--info-dir", type=Path, default=DEFAULT_INFO_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output root. Defaults to 41_pertmd_cdr_input for "
+                             "--fix-type all and 42_pertmd_all_input for --fix-type none.")
     parser.add_argument("--galaxy-refine", type=Path, default=DEFAULT_GALAXY_REFINE)
     parser.add_argument("--schedule", type=Path, default=DEFAULT_SCHEDULE)
     parser.add_argument("--target", action="append", default=None,
@@ -88,6 +91,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nodelist", default=DEFAULT_SLURM_NODELIST)
     parser.add_argument("--cpus-per-task", type=int, default=4)
     parser.add_argument("--nice", type=int, default=1000000)
+    parser.add_argument("--fix-type", choices=("all", "none"), default="all",
+                        help="GalaxyRefine fix_type: all fixes non-CDR/ULR atoms; none lets all atoms move.")
     return parser.parse_args()
 
 
@@ -269,6 +274,7 @@ def build_sbatch_script(
     nodelist: str,
     cpus_per_task: int,
     nice: int,
+    fix_type: str,
 ) -> str:
     job_name = slurm_job_name(target)
     log_path = target_dir / f"{job_name}.log.q"
@@ -288,7 +294,8 @@ def build_sbatch_script(
             f"-p {renum_pdb} "
             f"-s {renum_fasta} "
             f"-u {ulr_path} "
-            f"-sch {schedule}"
+            f"-sch {schedule} "
+            f"--fix-type {fix_type}"
         ),
     ]
     return "\n".join(lines) + "\n"
@@ -306,6 +313,7 @@ def prepare_target(
     nodelist: str,
     cpus_per_task: int,
     nice: int,
+    fix_type: str,
     overwrite: bool,
     dry_run: bool,
 ) -> Dict[str, object]:
@@ -389,6 +397,7 @@ def prepare_target(
             "residues": len(residue_map),
             "missing": len(missing),
             "ulr_blocks": sum(len(blocks) for blocks in cdr_blocks.values()),
+            "fix_type": fix_type,
         }
 
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -424,6 +433,7 @@ def prepare_target(
         nodelist=nodelist,
         cpus_per_task=cpus_per_task,
         nice=nice,
+        fix_type=fix_type,
     )
     with script_path.open("w") as handle:
         handle.write(script)
@@ -435,6 +445,7 @@ def prepare_target(
         "renum_pdb": str(renum_pdb),
         "fasta": str(renum_fasta),
         "chains": chain_order,
+        "fix_type": fix_type,
         "map": residue_map,
         "missing": missing,
         "cdr": cdr_blocks,
@@ -453,37 +464,52 @@ def prepare_target(
         "ulr": str(ulr_path),
         "map": str(map_path),
         "script": str(script_path),
+        "fix_type": fix_type,
     }
 
 
 def main() -> int:
     args = parse_args()
+    output_dir = args.output_dir
+    if output_dir is None:
+        output_dir = DEFAULT_OUTPUT_DIR_ALL if args.fix_type == "none" else DEFAULT_OUTPUT_DIR_CDR
     summaries = []
+    failures: List[Tuple[str, str]] = []
     for target in target_ids(args.source_dir, args.target, args.limit):
-        summary = prepare_target(
-            target=target,
-            source_dir=args.source_dir,
-            fasta_root=args.fasta_root,
-            output_dir=args.output_dir,
-            info_dir=args.info_dir,
-            galaxy_refine=args.galaxy_refine,
-            schedule=args.schedule,
-            partition=args.partition,
-            nodelist=args.nodelist,
-            cpus_per_task=args.cpus_per_task,
-            nice=args.nice,
-            overwrite=args.overwrite,
-            dry_run=args.dry_run,
-        )
-        if args.sbatch and not args.dry_run:
-            subprocess.run(["sbatch", summary["script"]], check=True)
+        try:
+            summary = prepare_target(
+                target=target,
+                source_dir=args.source_dir,
+                fasta_root=args.fasta_root,
+                output_dir=output_dir,
+                info_dir=args.info_dir,
+                galaxy_refine=args.galaxy_refine,
+                schedule=args.schedule,
+                partition=args.partition,
+                nodelist=args.nodelist,
+                cpus_per_task=args.cpus_per_task,
+                nice=args.nice,
+                fix_type=args.fix_type,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            if args.sbatch and not args.dry_run:
+                subprocess.run(["sbatch", summary["script"]], check=True)
+        except Exception as exc:  # noqa: BLE001 - keep the batch going on bad targets
+            failures.append((target, f"{type(exc).__name__}: {exc}"))
+            print(f"SKIP {target}\t{type(exc).__name__}: {exc}")
+            continue
         summaries.append(summary)
         print(
-            "{target}\tchains={chains}\tresidues={residues}\tmissing={missing}\tulr_blocks={ulr_blocks}".format(
+            "{target}\tchains={chains}\tresidues={residues}\tmissing={missing}\tulr_blocks={ulr_blocks}\tfix_type={fix_type}".format(
                 **summary
             )
         )
     print(f"Prepared {len(summaries)} target(s).")
+    if failures:
+        print(f"Skipped {len(failures)} target(s):")
+        for target, reason in failures:
+            print(f"  {target}\t{reason}")
     return 0
 
 

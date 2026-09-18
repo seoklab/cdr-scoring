@@ -1,0 +1,7 @@
+*.log
+runs/
+scripts/
+*.sh
+analyze/
+notebooks/
+configs/

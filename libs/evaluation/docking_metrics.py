@@ -87,7 +87,11 @@ def compute_dockq_style_metrics_from_structures(
     )
 
     irmsd = _superposed_rmsd(interface_nat, interface_mod, interface_nat, interface_mod)
-    lrmsd = _superposed_rmsd(receptor_nat, receptor_mod, ligand_nat, ligand_mod)
+    # DockQ convention (matches Galaxy reference step2_prep_input.py): the antigen
+    # is the receptor used for superposition and lRMSD is measured on the antibody
+    # (H/L). receptor_* here are the antibody backbone atoms, so align on the
+    # antigen (ligand_*) and measure RMSD on the antibody (receptor_*).
+    lrmsd = _superposed_rmsd(ligand_nat, ligand_mod, receptor_nat, receptor_mod)
 
     return DockQStyleMetricResult(
         native_path=native_path,

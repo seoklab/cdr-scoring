@@ -29,7 +29,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = REPO_ROOT.parent / "cdr-data"
 LIBS_ROOT = REPO_ROOT / "libs"
 if str(LIBS_ROOT) not in sys.path:
@@ -90,6 +90,13 @@ class LoopAtomPairs:
     model_coords: np.ndarray
     atom_to_res: np.ndarray
     loop_ids: np.ndarray
+    # Neighbour-only reference atoms (antigen / non-antibody chains). They are
+    # never scored and never enter the loop RMSD alignment, but they DO count
+    # as lDDT reference neighbours within LDDT_CUTOFF_A of a loop atom, so the
+    # loop lDDT becomes sensitive to how the antigen is placed.
+    ref_native_coords: np.ndarray
+    ref_model_coords: np.ndarray
+    ref_atom_to_res: np.ndarray
     missing_backbone_atom_count: int
 
 
@@ -105,7 +112,7 @@ COMMON_DECOY_COLUMNS = [
 ]
 
 LOOP_COLUMNS = COMMON_DECOY_COLUMNS + [
-    "global_loop_rmsd", "global_loop_lddt",
+    "cdr_rmsd", "cdr_lddt",
     "H1_loop_rmsd", "H2_loop_rmsd", "H3_loop_rmsd",
     "L1_loop_rmsd", "L2_loop_rmsd", "L3_loop_rmsd",
     "H1_loop_lddt", "H2_loop_lddt", "H3_loop_lddt",
@@ -161,7 +168,7 @@ def _decoy_identity(model, model_position: int) -> DecoyIdentity:
         sample = int(model_idx) if model_idx is not None else int(model_position + 1)
 
     method = (getattr(model, "method", "") or "").lower()
-    if method in ("commat", "pertmd"):
+    if method == "commat" or method.startswith("pertmd"):
         seed = None
 
     decoy_id = f"seed={seed}:sample={sample}" if seed is not None else f"sample={sample}"
@@ -301,15 +308,17 @@ def _backbone_lddt(nat_pts, mod_pts, atom_to_res, score_atom_mask) -> float:
     if len(nat_pts) < 2 or not score_atom_mask.any():
         return float("nan")
 
-    d_nat = _pairwise_distances(nat_pts)
-    d_mod = _pairwise_distances(mod_pts)
-    residue_mask = atom_to_res[:, None] != atom_to_res[None, :]
-    neighbor = residue_mask & (d_nat > 0) & (d_nat <= LDDT_CUTOFF_A)
-
+    # Only scored atoms are ever needed as rows; compute the compact
+    # (scored_atoms x all_atoms) distance blocks instead of the full N x N
+    # matrix. Numerically identical to selecting rows from the full matrix.
     score_idx = np.where(score_atom_mask)[0]
-    d_nat_rows = d_nat[score_idx]
-    d_mod_rows = d_mod[score_idx]
-    neighbor_rows = neighbor[score_idx]
+    row_nat = nat_pts[score_idx]
+    row_mod = mod_pts[score_idx]
+    row_res = atom_to_res[score_idx]
+
+    d_nat_rows = np.sqrt(np.sum((row_nat[:, None, :] - nat_pts[None, :, :]) ** 2, axis=-1))
+    d_mod_rows = np.sqrt(np.sum((row_mod[:, None, :] - mod_pts[None, :, :]) ** 2, axis=-1))
+    neighbor_rows = (row_res[:, None] != atom_to_res[None, :]) & (d_nat_rows > 0) & (d_nat_rows <= LDDT_CUTOFF_A)
     diff = np.abs(d_nat_rows - d_mod_rows)
 
     preserved = np.zeros_like(d_nat_rows, dtype=np.float64)
@@ -317,20 +326,13 @@ def _backbone_lddt(nat_pts, mod_pts, atom_to_res, score_atom_mask) -> float:
         preserved += (diff < threshold).astype(np.float64)
     preserved /= len(LDDT_THRESHOLDS_A)
 
-    residue_scores = []
-    score_res_ids = atom_to_res[score_idx]
-    for res_id in np.unique(score_res_ids):
-        row_mask = score_res_ids == res_id
-        atom_scores = []
-        for local_idx, is_match in enumerate(row_mask):
-            if not is_match:
-                continue
-            nbr = neighbor_rows[local_idx]
-            if nbr.any():
-                atom_scores.append(float(preserved[local_idx, nbr].mean()))
-        if atom_scores:
-            residue_scores.append(float(np.mean(atom_scores)))
-    return float(np.mean(residue_scores)) if residue_scores else float("nan")
+    # Micro-average (canonical global lDDT): every preserved distance counts
+    # equally, i.e. total preserved distances / total considered distances,
+    # rather than averaging per-atom then per-residue (macro-average).
+    total_pairs = int(neighbor_rows.sum())
+    if total_pairs == 0:
+        return float("nan")
+    return float(preserved[neighbor_rows].sum() / total_pairs)
 
 
 def _loop_id(chain_id: str, resseq: int) -> int:
@@ -345,30 +347,45 @@ def _collect_loop_atom_pairs(native_structure, model_structure) -> LoopAtomPairs
     model_coords: List[np.ndarray] = []
     atom_to_res: List[int] = []
     loop_ids: List[int] = []
+    ref_native: List[np.ndarray] = []
+    ref_model: List[np.ndarray] = []
+    ref_atom_to_res: List[int] = []
     missing = 0
     residue_idx = 0
 
     for chain_id, native_residue, model_residue in _matched_residue_pairs(native_structure, model_structure):
-        if chain_id not in DEFAULT_LOOP_RANGES:
-            continue
-        resseq = int(native_residue.id[1])
-        lid = _loop_id(chain_id, resseq)
         nat_atoms, mod_atoms, miss = _matching_backbone_coords(native_residue, model_residue)
-        missing += miss
-        if not nat_atoms:
-            continue
-        for nat_coord, mod_coord in zip(nat_atoms, mod_atoms):
-            native_coords.append(nat_coord)
-            model_coords.append(mod_coord)
-            atom_to_res.append(residue_idx)
-            loop_ids.append(lid)
-        residue_idx += 1
+        if chain_id in DEFAULT_LOOP_RANGES:
+            # Antibody chains: framework + CDR atoms, scored via loop_ids.
+            missing += miss
+            if not nat_atoms:
+                continue
+            resseq = int(native_residue.id[1])
+            lid = _loop_id(chain_id, resseq)
+            for nat_coord, mod_coord in zip(nat_atoms, mod_atoms):
+                native_coords.append(nat_coord)
+                model_coords.append(mod_coord)
+                atom_to_res.append(residue_idx)
+                loop_ids.append(lid)
+            residue_idx += 1
+        else:
+            # Antigen / other chains: neighbour-only lDDT reference atoms.
+            if not nat_atoms:
+                continue
+            for nat_coord, mod_coord in zip(nat_atoms, mod_atoms):
+                ref_native.append(nat_coord)
+                ref_model.append(mod_coord)
+                ref_atom_to_res.append(residue_idx)
+            residue_idx += 1
 
     return LoopAtomPairs(
-        native_coords=np.asarray(native_coords, dtype=np.float64),
-        model_coords=np.asarray(model_coords, dtype=np.float64),
+        native_coords=np.asarray(native_coords, dtype=np.float64).reshape(-1, 3),
+        model_coords=np.asarray(model_coords, dtype=np.float64).reshape(-1, 3),
         atom_to_res=np.asarray(atom_to_res, dtype=np.int32),
         loop_ids=np.asarray(loop_ids, dtype=np.int8),
+        ref_native_coords=np.asarray(ref_native, dtype=np.float64).reshape(-1, 3),
+        ref_model_coords=np.asarray(ref_model, dtype=np.float64).reshape(-1, 3),
+        ref_atom_to_res=np.asarray(ref_atom_to_res, dtype=np.int32),
         missing_backbone_atom_count=int(missing),
     )
 
@@ -383,21 +400,67 @@ def _masked_loop_rmsd(pairs: LoopAtomPairs, target_mask: np.ndarray) -> float:
     )
 
 
-def _masked_loop_lddt(pairs: LoopAtomPairs, target_mask: np.ndarray) -> float:
-    return _backbone_lddt(
-        pairs.native_coords,
-        pairs.model_coords,
-        pairs.atom_to_res,
-        target_mask,
-    )
+def _prepare_loop_lddt(pairs: LoopAtomPairs):
+    """Precompute the (loop-atom x reference-atom) lDDT tensors once.
+
+    Rows are the loop backbone atoms (the only atoms ever scored); columns are
+    the full reference environment: every antibody (H/L) backbone atom plus the
+    neighbour-only reference atoms (antigen chains). The distance matrices are
+    built a single time and reused for the global and per-CDR masks, replacing
+    the previous per-mask O(N^2) recomputation. The per-pair values are
+    identical to _backbone_lddt; only the antigen reference columns are new.
+    """
+    nat_hl = pairs.native_coords
+    if len(nat_hl) < 2:
+        return None
+    loop_rows = np.where(pairs.loop_ids > 0)[0]
+    if loop_rows.size == 0:
+        return None
+
+    if len(pairs.ref_native_coords):
+        col_nat = np.concatenate([nat_hl, pairs.ref_native_coords], axis=0)
+        col_mod = np.concatenate([pairs.model_coords, pairs.ref_model_coords], axis=0)
+        col_res = np.concatenate([pairs.atom_to_res, pairs.ref_atom_to_res])
+    else:
+        col_nat, col_mod, col_res = nat_hl, pairs.model_coords, pairs.atom_to_res
+
+    row_nat = nat_hl[loop_rows]
+    row_mod = pairs.model_coords[loop_rows]
+    row_res = pairs.atom_to_res[loop_rows]
+
+    d_nat = np.sqrt(np.sum((row_nat[:, None, :] - col_nat[None, :, :]) ** 2, axis=-1))
+    d_mod = np.sqrt(np.sum((row_mod[:, None, :] - col_mod[None, :, :]) ** 2, axis=-1))
+    neighbor = (row_res[:, None] != col_res[None, :]) & (d_nat > 0) & (d_nat <= LDDT_CUTOFF_A)
+
+    diff = np.abs(d_nat - d_mod)
+    preserved = np.zeros_like(d_nat)
+    for threshold in LDDT_THRESHOLDS_A:
+        preserved += diff < threshold
+    preserved /= len(LDDT_THRESHOLDS_A)
+    return loop_rows, neighbor, preserved
+
+
+def _loop_lddt_from_prep(prep, target_mask: np.ndarray) -> float:
+    if prep is None:
+        return float("nan")
+    loop_rows, neighbor, preserved = prep
+    sub = target_mask[loop_rows]
+    if not sub.any():
+        return float("nan")
+    nb = neighbor[sub]
+    total = int(nb.sum())
+    if total == 0:
+        return float("nan")
+    return float(preserved[sub][nb].sum() / total)
 
 
 def compute_loop_row(native_structure, model_structure) -> Dict[str, float | int | str]:
     row: Dict[str, float | int | str] = {}
     pairs = _collect_loop_atom_pairs(native_structure, model_structure)
+    prep = _prepare_loop_lddt(pairs)
     global_mask = pairs.loop_ids > 0
-    row["global_loop_rmsd"] = _masked_loop_rmsd(pairs, global_mask)
-    row["global_loop_lddt"] = _masked_loop_lddt(pairs, global_mask)
+    row["cdr_rmsd"] = _masked_loop_rmsd(pairs, global_mask)
+    row["cdr_lddt"] = _loop_lddt_from_prep(prep, global_mask)
     row["missing_backbone_atom_count"] = int(pairs.missing_backbone_atom_count)
     row["missing_backbone_report"] = (
         f"masked_backbone_atoms={int(pairs.missing_backbone_atom_count)}"
@@ -408,7 +471,7 @@ def compute_loop_row(native_structure, model_structure) -> Dict[str, float | int
     for loop_idx, (name, _chain_id, _start, _end) in enumerate(DEFAULT_NAMED_LOOP_RANGES, start=1):
         loop_mask = pairs.loop_ids == loop_idx
         row[f"{name}_loop_rmsd"] = _masked_loop_rmsd(pairs, loop_mask)
-        row[f"{name}_loop_lddt"] = _masked_loop_lddt(pairs, loop_mask)
+        row[f"{name}_loop_lddt"] = _loop_lddt_from_prep(prep, loop_mask)
     return row
 
 
@@ -424,13 +487,55 @@ def _heavy_atom_coords(residue) -> List[np.ndarray]:
     return coords
 
 
-def _has_contact(coords_a, coords_b, cutoff_sq: float) -> bool:
-    for a in coords_a:
-        for b in coords_b:
-            diff = a - b
-            if float(np.dot(diff, diff)) <= cutoff_sq:
-                return True
-    return False
+def _flat_heavy_atoms(residue_map, chains):
+    """Flatten heavy atoms of the given chains into (coords Nx3, group index
+    per atom, residue-key list). Residues with no heavy atoms are omitted, so
+    they can never appear as a contact (matching the original loop)."""
+    coords: List[np.ndarray] = []
+    atom_group: List[int] = []
+    keys: List[Tuple[str, tuple]] = []
+    for chain_id in chains:
+        for residue_id, residue in residue_map.get(chain_id, {}).items():
+            atoms = _heavy_atom_coords(residue)
+            if not atoms:
+                continue
+            group = len(keys)
+            keys.append((chain_id, residue_id))
+            for coord in atoms:
+                coords.append(coord)
+                atom_group.append(group)
+    arr = np.asarray(coords, dtype=np.float64).reshape(-1, 3)
+    return arr, np.asarray(atom_group, dtype=np.int64), keys
+
+
+def _residue_hit_matrix(rec_arr, rec_grp, n_rec, lig_arr, lig_grp, n_lig, cutoff_a):
+    """Boolean (n_rec, n_lig): residue pair has any heavy-atom pair within
+    cutoff. Vectorized equivalent of the nested-loop _has_contact test
+    (distance <= cutoff)."""
+    hits = np.zeros((n_rec, n_lig), dtype=bool)
+    if len(rec_arr) == 0 or len(lig_arr) == 0:
+        return hits
+    cutoff_sq = cutoff_a * cutoff_a
+    block = 1024
+    for start in range(0, len(rec_arr), block):
+        sub = rec_arr[start:start + block]
+        d2 = np.sum((sub[:, None, :] - lig_arr[None, :, :]) ** 2, axis=-1)
+        ai, bj = np.where(d2 <= cutoff_sq)
+        if ai.size:
+            hits[rec_grp[start + ai], lig_grp[bj]] = True
+    return hits
+
+
+def _pairs_from_hits(hits, rec_keys, lig_keys, cdr_only=False):
+    contacts = set()
+    ri, lj = np.where(hits)
+    for i, j in zip(ri.tolist(), lj.tolist()):
+        rec_chain, rec_id = rec_keys[i]
+        if cdr_only and not _is_loop_residue(rec_chain, int(rec_id[1])):
+            continue
+        lig_chain, lig_id = lig_keys[j]
+        contacts.add((rec_chain, rec_id, lig_chain, lig_id))
+    return contacts
 
 
 def _contact_pairs(
@@ -441,22 +546,11 @@ def _contact_pairs(
     cutoff_a: float,
     cdr_only: bool = False,
 ) -> set[Tuple[str, tuple, str, tuple]]:
-    cutoff_sq = cutoff_a * cutoff_a
-    contacts = set()
-    for rec_chain in receptor_chains:
-        for lig_chain in ligand_chains:
-            for rec_id, rec_residue in residue_map.get(rec_chain, {}).items():
-                rec_resseq = int(rec_id[1])
-                if cdr_only and not _is_loop_residue(rec_chain, rec_resseq):
-                    continue
-                rec_atoms = _heavy_atom_coords(rec_residue)
-                if not rec_atoms:
-                    continue
-                for lig_id, lig_residue in residue_map.get(lig_chain, {}).items():
-                    lig_atoms = _heavy_atom_coords(lig_residue)
-                    if lig_atoms and _has_contact(rec_atoms, lig_atoms, cutoff_sq):
-                        contacts.add((rec_chain, rec_id, lig_chain, lig_id))
-    return contacts
+    """Backwards-compatible wrapper over the vectorized contact engine."""
+    rec_arr, rec_grp, rec_keys = _flat_heavy_atoms(residue_map, receptor_chains)
+    lig_arr, lig_grp, lig_keys = _flat_heavy_atoms(residue_map, ligand_chains)
+    hits = _residue_hit_matrix(rec_arr, rec_grp, len(rec_keys), lig_arr, lig_grp, len(lig_keys), cutoff_a)
+    return _pairs_from_hits(hits, rec_keys, lig_keys, cdr_only=cdr_only)
 
 
 def _collect_backbone_by_keys(native_map, model_map, keys: Sequence[Tuple[str, tuple]]):
@@ -507,44 +601,94 @@ def _interface_lddt(native_structure, model_structure, interface_keys: set[Tuple
     return _backbone_lddt(nat_pts, mod_pts, atom_to_res, score_mask)
 
 
-def compute_interface_rows(
-    native_structure,
-    model_structure,
-    *,
-    contact_cutoff_a: float,
-    interface_cutoff_a: float,
-) -> Tuple[Dict[str, float | int], Dict[str, float]]:
+def _nan_interface_rows(report: Optional[str] = None):
+    """Interface + DockQ rows for a target with no antibody-antigen interface
+    (apo, or missing antibody/antigen chain). Identical to the previous
+    early-return dict; `report` is set only on the exception path."""
+    interface_row = {
+        "interface_bb_lddt": float("nan"),
+        "interface_rmsd": float("nan"),
+        "irmsd": float("nan"),
+        "lrmsd": float("nan"),
+        "cdr_antigen_contact_count": 0,
+        "cdr_antigen_contact_recovery": float("nan"),
+        "fnat": float("nan"),
+        "native_contact_count": 0,
+        "decoy_contact_count": 0,
+    }
+    if report is not None:
+        interface_row["interface_metric_report"] = report
+    dockq_row = {"dockq": float("nan"), "fnat": float("nan"), "irmsd": float("nan"), "lrmsd": float("nan")}
+    return interface_row, dockq_row
+
+
+@dataclass
+class NativeInterfaceCache:
+    """Native-only interface quantities, computed once and reused across all
+    decoys of a target (they never depend on the decoy)."""
+    native_structure: object
+    native_map: Dict[str, Dict[tuple, object]]
+    receptor_chains: Tuple[str, ...]
+    ligand_chains: Tuple[str, ...]
+    contact_cutoff_a: float
+    native_contacts: set
+    native_cdr_contacts: set
+    iface_keys: set
+    receptor_keys: list
+    ligand_keys: list
+
+
+def _build_native_interface_cache(native_structure, contact_cutoff_a, interface_cutoff_a):
+    """Precompute native interface quantities once per target. Returns None for
+    apo targets (no antibody chain or no antigen chain)."""
     native_map = _residue_map(native_structure)
-    model_map = _residue_map(model_structure)
     receptor_chains = tuple(chain for chain in ANTIBODY_CHAINS if chain in native_map)
     ligand_chains = tuple(sorted(set(native_map) - set(receptor_chains)))
     if not receptor_chains or not ligand_chains:
-        nan_interface = {
-            "interface_bb_lddt": float("nan"),
-            "interface_rmsd": float("nan"),
-            "irmsd": float("nan"),
-            "lrmsd": float("nan"),
-            "cdr_antigen_contact_count": 0,
-            "cdr_antigen_contact_recovery": float("nan"),
-            "fnat": float("nan"),
-            "native_contact_count": 0,
-            "decoy_contact_count": 0,
-        }
-        return nan_interface, {"dockq": float("nan"), "fnat": float("nan"), "irmsd": float("nan"), "lrmsd": float("nan")}
+        return None
 
-    native_contacts = _contact_pairs(
-        native_map, receptor_chains, ligand_chains, cutoff_a=contact_cutoff_a, cdr_only=False,
-    )
-    decoy_contacts = _contact_pairs(
-        model_map, receptor_chains, ligand_chains, cutoff_a=contact_cutoff_a, cdr_only=False,
-    )
-    native_cdr_contacts = _contact_pairs(
-        native_map, receptor_chains, ligand_chains, cutoff_a=contact_cutoff_a, cdr_only=True,
-    )
-    decoy_cdr_contacts = _contact_pairs(
-        model_map, receptor_chains, ligand_chains, cutoff_a=contact_cutoff_a, cdr_only=True,
+    # Single heavy-atom gather; derive the contact (5 A) and interface (10 A)
+    # sets from the same atoms. CDR contacts are a subset of the full 5 A set.
+    rec_arr, rec_grp, rec_keys = _flat_heavy_atoms(native_map, receptor_chains)
+    lig_arr, lig_grp, lig_keys = _flat_heavy_atoms(native_map, ligand_chains)
+    hits_contact = _residue_hit_matrix(rec_arr, rec_grp, len(rec_keys), lig_arr, lig_grp, len(lig_keys), contact_cutoff_a)
+    hits_iface = _residue_hit_matrix(rec_arr, rec_grp, len(rec_keys), lig_arr, lig_grp, len(lig_keys), interface_cutoff_a)
+
+    native_contacts = _pairs_from_hits(hits_contact, rec_keys, lig_keys, cdr_only=False)
+    native_cdr_contacts = _pairs_from_hits(hits_contact, rec_keys, lig_keys, cdr_only=True)
+    interface_contacts_for_rmsd = _pairs_from_hits(hits_iface, rec_keys, lig_keys, cdr_only=False)
+    iface_keys = {
+        (rec_chain, rec_id) for rec_chain, rec_id, _lig_chain, _lig_id in interface_contacts_for_rmsd
+    } | {
+        (lig_chain, lig_id) for _rec_chain, _rec_id, lig_chain, lig_id in interface_contacts_for_rmsd
+    }
+    return NativeInterfaceCache(
+        native_structure=native_structure,
+        native_map=native_map,
+        receptor_chains=receptor_chains,
+        ligand_chains=ligand_chains,
+        contact_cutoff_a=contact_cutoff_a,
+        native_contacts=native_contacts,
+        native_cdr_contacts=native_cdr_contacts,
+        iface_keys=iface_keys,
+        receptor_keys=_all_residue_keys(native_map, receptor_chains),
+        ligand_keys=_all_residue_keys(native_map, ligand_chains),
     )
 
+
+def _interface_metrics_from_cache(cache: "NativeInterfaceCache", model_structure, model_map=None):
+    if model_map is None:
+        model_map = _residue_map(model_structure)
+
+    # Decoy contacts (vectorized); native side comes from the cache.
+    rec_arr, rec_grp, rec_keys = _flat_heavy_atoms(model_map, cache.receptor_chains)
+    lig_arr, lig_grp, lig_keys = _flat_heavy_atoms(model_map, cache.ligand_chains)
+    hits = _residue_hit_matrix(rec_arr, rec_grp, len(rec_keys), lig_arr, lig_grp, len(lig_keys), cache.contact_cutoff_a)
+    decoy_contacts = _pairs_from_hits(hits, rec_keys, lig_keys, cdr_only=False)
+    decoy_cdr_contacts = _pairs_from_hits(hits, rec_keys, lig_keys, cdr_only=True)
+
+    native_contacts = cache.native_contacts
+    native_cdr_contacts = cache.native_cdr_contacts
     fnat = (
         len(native_contacts & decoy_contacts) / len(native_contacts)
         if native_contacts else float("nan")
@@ -554,26 +698,17 @@ def compute_interface_rows(
         if native_cdr_contacts else float("nan")
     )
 
-    interface_contacts_for_rmsd = _contact_pairs(
-        native_map, receptor_chains, ligand_chains, cutoff_a=interface_cutoff_a, cdr_only=False,
-    )
-    iface_keys = {
-        (rec_chain, rec_id)
-        for rec_chain, rec_id, _lig_chain, _lig_id in interface_contacts_for_rmsd
-    } | {
-        (lig_chain, lig_id)
-        for _rec_chain, _rec_id, lig_chain, lig_id in interface_contacts_for_rmsd
-    }
-    receptor_keys = _all_residue_keys(native_map, receptor_chains)
-    ligand_keys = _all_residue_keys(native_map, ligand_chains)
-
-    interface_nat, interface_mod = _collect_backbone_by_keys(native_map, model_map, list(iface_keys))
-    receptor_nat, receptor_mod = _collect_backbone_by_keys(native_map, model_map, receptor_keys)
-    ligand_nat, ligand_mod = _collect_backbone_by_keys(native_map, model_map, ligand_keys)
+    interface_nat, interface_mod = _collect_backbone_by_keys(cache.native_map, model_map, list(cache.iface_keys))
+    receptor_nat, receptor_mod = _collect_backbone_by_keys(cache.native_map, model_map, cache.receptor_keys)
+    ligand_nat, ligand_mod = _collect_backbone_by_keys(cache.native_map, model_map, cache.ligand_keys)
 
     irmsd = _aligned_rmsd(interface_nat, interface_mod, interface_nat, interface_mod)
-    lrmsd = _aligned_rmsd(receptor_nat, receptor_mod, ligand_nat, ligand_mod)
-    interface_bb_lddt = _interface_lddt(native_structure, model_structure, iface_keys)
+    # DockQ convention (matches Galaxy reference step2_prep_input.py): the antigen
+    # is the receptor used for superposition and lRMSD is measured on the antibody
+    # (H/L). receptor_keys here are antibody chains, so align on the antigen
+    # (ligand_*) and measure RMSD on the antibody (receptor_*).
+    lrmsd = _aligned_rmsd(ligand_nat, ligand_mod, receptor_nat, receptor_mod)
+    interface_bb_lddt = _interface_lddt(cache.native_structure, model_structure, cache.iface_keys)
     dockq = (
         (fnat + 1.0 / (1.0 + (irmsd / 1.5) ** 2) + 1.0 / (1.0 + (lrmsd / 8.5) ** 2)) / 3.0
         if math.isfinite(fnat) and math.isfinite(irmsd) and math.isfinite(lrmsd)
@@ -595,8 +730,23 @@ def compute_interface_rows(
     return interface_row, dockq_row
 
 
+def compute_interface_rows(
+    native_structure,
+    model_structure,
+    *,
+    contact_cutoff_a: float,
+    interface_cutoff_a: float,
+) -> Tuple[Dict[str, float | int], Dict[str, float]]:
+    """Single-decoy convenience wrapper. The batch pipeline builds the native
+    cache once per target (see the main loop) instead of calling this per decoy."""
+    cache = _build_native_interface_cache(native_structure, contact_cutoff_a, interface_cutoff_a)
+    if cache is None:
+        return _nan_interface_rows()
+    return _interface_metrics_from_cache(cache, model_structure)
+
+
 def _is_boltz2_source(source: str) -> bool:
-    return _source_key(source) == "boltz2"
+    return _source_key(source).startswith("boltz2")
 
 
 def _boltz2_model_number(model, identity: DecoyIdentity) -> Optional[int]:
@@ -918,6 +1068,16 @@ def run(args):
                         models,
                     )
 
+                    # Build native interface quantities once per target (B).
+                    # None => apo target (no antibody-antigen interface) (A).
+                    interface_cache = None
+                    interface_is_apo = False
+                    if needs_interface_calculation:
+                        interface_cache = _build_native_interface_cache(
+                            target.gt_structure, args.contact_cutoff, args.interface_cutoff
+                        )
+                        interface_is_apo = interface_cache is None
+
                     decoy_iter = enumerate(models)
                     if use_tqdm:
                         decoy_iter = tqdm(
@@ -957,8 +1117,8 @@ def run(args):
                             except Exception as exc:
                                 failed = dict(common)
                                 failed.update({
-                                    "global_loop_rmsd": float("nan"),
-                                    "global_loop_lddt": float("nan"),
+                                    "cdr_rmsd": float("nan"),
+                                    "cdr_lddt": float("nan"),
                                     "missing_backbone_atom_count": float("nan"),
                                     "missing_backbone_report": f"loop_metric_failed: {exc}",
                                 })
@@ -968,27 +1128,28 @@ def run(args):
                                 loop_rows.append(failed)
 
                         if needs_interface_calculation:
-                            try:
-                                interface_row, dockq_row = compute_interface_rows(
-                                    target.gt_structure,
-                                    model.md_structure,
-                                    contact_cutoff_a=args.contact_cutoff,
-                                    interface_cutoff_a=args.interface_cutoff,
-                                )
-                            except Exception as exc:
-                                interface_row = {
-                                    "interface_bb_lddt": float("nan"),
-                                    "interface_rmsd": float("nan"),
-                                    "irmsd": float("nan"),
-                                    "lrmsd": float("nan"),
-                                    "cdr_antigen_contact_count": float("nan"),
-                                    "cdr_antigen_contact_recovery": float("nan"),
-                                    "fnat": float("nan"),
-                                    "native_contact_count": float("nan"),
-                                    "decoy_contact_count": float("nan"),
-                                    "interface_metric_report": f"interface_metric_failed: {exc}",
-                                }
-                                dockq_row = {"dockq": float("nan"), "fnat": float("nan"), "irmsd": float("nan"), "lrmsd": float("nan")}
+                            if interface_is_apo:
+                                # A: apo target -> no per-decoy interface work.
+                                interface_row, dockq_row = _nan_interface_rows()
+                            else:
+                                try:
+                                    interface_row, dockq_row = _interface_metrics_from_cache(
+                                        interface_cache, model.md_structure
+                                    )
+                                except Exception as exc:
+                                    interface_row = {
+                                        "interface_bb_lddt": float("nan"),
+                                        "interface_rmsd": float("nan"),
+                                        "irmsd": float("nan"),
+                                        "lrmsd": float("nan"),
+                                        "cdr_antigen_contact_count": float("nan"),
+                                        "cdr_antigen_contact_recovery": float("nan"),
+                                        "fnat": float("nan"),
+                                        "native_contact_count": float("nan"),
+                                        "decoy_contact_count": float("nan"),
+                                        "interface_metric_report": f"interface_metric_failed: {exc}",
+                                    }
+                                    dockq_row = {"dockq": float("nan"), "fnat": float("nan"), "irmsd": float("nan"), "lrmsd": float("nan")}
 
                             if compute_interface:
                                 full_interface_row = dict(common)
