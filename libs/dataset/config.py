@@ -338,6 +338,7 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
         max_context_residues=int(gb_raw.get("max_context_residues", 120)),
         graph_crop_debug=bool(gb_raw.get("graph_crop_debug", False)),
         on_the_fly=gb_raw.get("on_the_fly", True),
+        atom_graph=bool(gb_raw.get("atom_graph", False)),
     )
 
     # sources

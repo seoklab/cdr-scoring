@@ -166,6 +166,7 @@ def main():
                     max_context_residues=params['max_context_residues'],
                     graph_crop_debug=False,
                     target_id=cand.pdb_id,
+                    atom_graph=params['atom_graph'],
                 )
                 if not graphs:
                     n_failed += 1
