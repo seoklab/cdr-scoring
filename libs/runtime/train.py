@@ -117,6 +117,67 @@ def _in_groups(g, gids):
     return m
 
 
+# ── decoy scheduling 2026-11-07: which comparisons would change the current pick ──
+def _sched_critical_mask(scores, y, g, pos, neg, topk=1, min_delta=0.0):
+    """Bool mask over the pairs: would fixing this pair move its group's top1?
+
+    ``pos``/``neg`` index the higher- and lower-label candidate of each pair (both in the
+    same pair group ``g``). A pair is selection-critical when its LOWER-label candidate is
+    among the top-``topk`` candidates by the CURRENT model score of its group, and the
+    higher-label one is at least ``min_delta`` better. Every other pair re-orders
+    candidates that would not have been picked anyway.
+
+    ``scores`` must be detached; one target per batch, so a group is this target's
+    candidates from one source group.
+    """
+    crit = torch.zeros(pos.numel(), dtype=torch.bool, device=pos.device)
+    if pos.numel() == 0:
+        return crit
+    for gi in torch.unique(g[pos]):
+        idx = torch.nonzero(g == gi, as_tuple=False).reshape(-1)
+        k = min(int(topk), int(idx.numel()))
+        if k <= 0:
+            continue
+        is_top = torch.zeros_like(g, dtype=torch.bool)
+        is_top[idx[torch.topk(scores[idx], k).indices]] = True
+        crit |= is_top[neg] & ((y[pos] - y[neg]) >= float(min_delta))
+    return crit
+
+
+def _sched_pair_loss(fn, crit, share):
+    """share * mean(loss over critical pairs) + (1 - share) * mean(loss over the rest).
+
+    ``fn(mask)`` returns the pair loss over the selected pairs (mask None = all of them).
+    Falls back to the plain loss when one side is empty, so a group whose pick is already
+    its best candidate is trained exactly as before. Returns (loss, n_critical).
+    """
+    if crit is None:
+        return fn(None), 0
+    n = int(crit.sum())
+    if n == 0 or n == crit.numel():
+        return fn(None), n
+    return float(share) * fn(crit) + (1.0 - float(share)) * fn(~crit), n
+
+
+def _sched_group_stats(scores, y, g, gids):
+    """In-batch headroom readout for the groups in ``gids``: how far the current pick is
+    from the best candidate, and where the best candidate sits in the current ranking."""
+    gap, rank, hit, n = 0.0, 0.0, 0.0, 0
+    for gi in gids:
+        idx = torch.nonzero((g == int(gi)) & torch.isfinite(y), as_tuple=False).reshape(-1)
+        if idx.numel() < 2:
+            continue
+        i_pick = idx[int(torch.argmax(scores[idx]))]
+        i_best = idx[int(torch.argmax(y[idx]))]
+        gap += float(y[i_best] - y[i_pick])
+        rank += float((scores[idx] > scores[i_best]).sum()) + 1.0
+        hit += float(i_pick == i_best)
+        n += 1
+    if n == 0:
+        return None
+    return {'gap': gap / n, 'rank_of_best': rank / n, 'pick_is_best': hit / n, 'n_groups': float(n)}
+
+
 def _vanilla_decoy_mask(args, eval_metrics, labels, device):
     """fvctx vanilla fine-tune: bool mask of the decoys in --vanilla_group(s), None when off."""
     gids = getattr(args, '_vanilla_gids', None)
@@ -654,6 +715,37 @@ def load_state(model: nn.Module, optimizer: Optimizer, path: pathlib.Path, callb
 _NO_DECAY_HEADS = ('linear_out_1', 'final_head', 'interface_head', 'ord_head', 'aux_reg_head')
 
 
+def _atom_lr_split(groups, model, args, local_rank, tag):
+    """Give the atom encoder its own (higher) learning rate.
+
+    Arm B fine-tunes a converged trunk while the atom encoder starts from scratch,
+    so one shared lr is wrong for both: too high wrecks the trunk, too low leaves
+    the encoder at its initialisation. Splits every group in two and scales the
+    atom half by ``--atom_lr_mult``. A no-op when the encoder is off or mult == 1.
+    """
+    mult = float(getattr(args, 'atom_lr_mult', 1.0))
+    if not getattr(args, 'atom_encoder', False) or mult == 1.0:
+        return groups
+    atom_ids = {id(p) for n, p in model.named_parameters()
+                if n.startswith(('atom_encoder.', 'atom_to_res.'))
+                or '.atom_encoder.' in n or '.atom_to_res.' in n}
+    if not atom_ids:
+        return groups
+    out, n_atom = [], 0
+    for g in groups:
+        base = [p for p in g['params'] if id(p) not in atom_ids]
+        atom = [p for p in g['params'] if id(p) in atom_ids]
+        if base:
+            out.append({**g, 'params': base})
+        if atom:
+            n_atom += len(atom)
+            out.append({**g, 'params': atom, 'lr': float(args.learning_rate) * mult})
+    if local_rank == 0:
+        print(f'[{tag}] atom encoder lr split: {n_atom} tensors at '
+              f'{float(args.learning_rate) * mult:g} (x{mult:g}), rest at {args.learning_rate:g}')
+    return out
+
+
 def _param_groups(model, args, local_rank, tag):
     """AdamW parameter groups: keep weight decay off the output heads and 1-D params.
 
@@ -673,7 +765,7 @@ def _param_groups(model, args, local_rank, tag):
     part that can actually overfit is unchanged.
     """
     if not getattr(args, 'no_decay_heads', False):
-        return model.parameters()
+        return _atom_lr_split([{'params': list(model.parameters())}], model, args, local_rank, tag)
     decay, no_decay, nd_names = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -687,8 +779,9 @@ def _param_groups(model, args, local_rank, tag):
               f'{args.weight_decay}, {len(no_decay)} excluded (heads + 1-D params)')
         print(f'[{tag}] excluded heads: '
               f'{[n for n in nd_names if any(h in n for h in _NO_DECAY_HEADS)]}')
-    return [{'params': decay, 'weight_decay': float(args.weight_decay)},
-            {'params': no_decay, 'weight_decay': 0.0}]
+    return _atom_lr_split([{'params': decay, 'weight_decay': float(args.weight_decay)},
+                           {'params': no_decay, 'weight_decay': 0.0}],
+                          model, args, local_rank, tag)
 
 
 def _resolve_gen_source_ids(args, spec, local_rank, tag):
@@ -2175,6 +2268,10 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
     _typed = bool(getattr(args, 'dpo_typed_pairs', False))
     _type_w = [float(x) for x in str(getattr(args, 'dpo_type_weights', '0.45,0.45,0.10')).split(',')]
     _near_cut = getattr(args, 'near_native_cutoff', None)
+    # decoy scheduling: on only while training, after the warm-up, and only on the typed-pair path
+    _sched_share = float(getattr(args, 'pair_sched_share', 0.0))
+    _sched_on = (bool(getattr(args, 'pair_sched', False)) and _typed and is_train and probe is None
+                 and epoch_idx > int(getattr(args, 'pair_sched_warmup_epochs', 0)))
 
     for i, batch in tqdm(enumerate(dataloader), total=len(dataloader), unit='batch',
                          desc=f'{train_tag} Epoch {epoch_idx}', disable=(local_rank != 0)):
@@ -2202,6 +2299,7 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
         try:
             _typed_pairs = None
             _typed_extra = None
+            _sched_crit = None
             for callback in callbacks:
                 callback.on_batch_start()
 
@@ -2363,6 +2461,18 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
                             _keep = torch.randperm(_pos.numel(), generator=_gen)[:_cap].to(device)
                             _pos, _neg, _types = _pos[_keep], _neg[_keep], _types[_keep]
                         _typed_pairs = (_pos, _neg, _types)
+                        if _sched_on:
+                            _sched_crit = _sched_critical_mask(
+                                pi_out.detach().reshape(-1), _y, _g, _pos, _neg,
+                                topk=int(getattr(args, 'pair_sched_topk', 1)),
+                                min_delta=float(getattr(args, 'pair_sched_min_delta', 0.0)))
+                            _gids_all = [int(x) for x in torch.unique(_g[_g >= 0]).tolist()]
+                            _vg_ids = list(getattr(args, '_vanilla_gids', None) or []) or _gids_all
+                            for _nm, _ids in (('van', _vg_ids), ('all', _gids_all)):
+                                _st = _sched_group_stats(pi_out.detach().reshape(-1), _y, _g, _ids)
+                                if _st is not None:
+                                    for _k, _v in _st.items():
+                                        out[f'sched_{_nm}_{_k}'] = float(_v)
                         if getattr(args, '_vanilla_gids', None):
                             _typed_extra = (_in_groups(_g[_pos], args._vanilla_gids), _y[_pos] - _y[_neg])
                         pairs = []
@@ -2422,12 +2532,38 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
                         _isv, _pd = _typed_extra
                         _w = float(args.vanilla_share)
                         _P, _N, _T = _typed_pairs
+                        # decoy scheduling splits each side into the pairs that would move its
+                        # group's top1 and the rest; the vanilla / rest balance is untouched.
+                        _Pv, _Nv, _Tv = _P[_isv], _N[_isv], _T[_isv]
+                        _Pr, _Nr, _Tr = _P[~_isv], _N[~_isv], _T[~_isv]
+                        _Cv = _sched_crit[_isv] if _sched_crit is not None else None
+                        _Cr = _sched_crit[~_isv] if _sched_crit is not None else None
                         if bool(getattr(args, 'vanilla_dpo_uniform', False)):
-                            _lv = tier_dpo.dpo_pair_mean_loss(pi_out, ref_out, _P[_isv], _N[_isv], device)
+                            def _vfn(m, _p=_Pv, _n=_Nv):
+                                if m is not None:
+                                    _p, _n = _p[m], _n[m]
+                                return tier_dpo.dpo_pair_mean_loss(pi_out, ref_out, _p, _n, device)
                         else:
-                            _lv, _ = tier_dpo.dpo_typed_loss(pi_out, ref_out, _P[_isv], _N[_isv], _T[_isv], _type_w, device)
-                        _lr, _ = tier_dpo.dpo_typed_loss(pi_out, ref_out, _P[~_isv], _N[~_isv], _T[~_isv], _type_w, device)
+                            def _vfn(m, _p=_Pv, _n=_Nv, _t=_Tv):
+                                if m is not None:
+                                    _p, _n, _t = _p[m], _n[m], _t[m]
+                                return tier_dpo.dpo_typed_loss(pi_out, ref_out, _p, _n, _t, _type_w, device)[0]
+
+                        def _rfn(m, _p=_Pr, _n=_Nr, _t=_Tr):
+                            if m is not None:
+                                _p, _n, _t = _p[m], _n[m], _t[m]
+                            return tier_dpo.dpo_typed_loss(pi_out, ref_out, _p, _n, _t, _type_w, device)[0]
+                        _lv, _ncv = _sched_pair_loss(_vfn, _Cv, _sched_share)
+                        _lr, _ncr = _sched_pair_loss(_rfn, _Cr, _sched_share)
                         within_loss = _w * _lv + (1.0 - _w) * _lr
+                        if _sched_crit is not None:
+                            out['sched_n_crit_vanilla'] = float(_ncv)
+                            out['sched_n_crit_rest'] = float(_ncr)
+                            out['sched_n_crit'] = float(int(_sched_crit.sum()))
+                            out['sched_frac_crit'] = float(_sched_crit.float().mean()) if _sched_crit.numel() else 0.0
+                            with torch.no_grad():
+                                _mgc = (pi_out[_P[_sched_crit]] - pi_out[_N[_sched_crit]]) > 0
+                                out['sched_acc_crit'] = float(_mgc.float().mean()) if _mgc.numel() else 0.0
                         _n_by = {t: int((_T == t).sum()) for t in range(3)}
                         with torch.no_grad():
                             _mgv = (pi_out[_P] - pi_out[_N]) > 0
@@ -2442,8 +2578,17 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
                                 out[f'dpo_n_vanilla_{_nm}'] = float(_sel.sum())
                                 out[f'dpo_acc_vanilla_{_nm}'] = float(_mgv[_sel].float().mean()) if bool(_sel.any()) else 0.0
                     else:
-                        within_loss, _n_by = tier_dpo.dpo_typed_loss(
-                            pi_out, ref_out, _typed_pairs[0], _typed_pairs[1], _typed_pairs[2], _type_w, device)
+                        _P0, _N0, _T0 = _typed_pairs
+
+                        def _afn(m, _p=_P0, _n=_N0, _t=_T0):
+                            if m is not None:
+                                _p, _n, _t = _p[m], _n[m], _t[m]
+                            return tier_dpo.dpo_typed_loss(pi_out, ref_out, _p, _n, _t, _type_w, device)[0]
+                        within_loss, _nc0 = _sched_pair_loss(_afn, _sched_crit, _sched_share)
+                        _n_by = {t: int((_T0 == t).sum()) for t in range(3)}
+                        if _sched_crit is not None:
+                            out['sched_n_crit'] = float(_nc0)
+                            out['sched_frac_crit'] = float(_sched_crit.float().mean()) if _sched_crit.numel() else 0.0
                     n_within = int(_typed_pairs[0].numel())
                     out['dpo_n_near_near'] = float(_n_by[0])
                     out['dpo_n_near_non'] = float(_n_by[1])
@@ -2976,7 +3121,7 @@ def _ab_epoch_end(model, optimizer, callbacks, epoch_idx, mv, ep_train, st, args
     pa = float(mv.get(f'val/{pool}/gen_pair_acc', nan))
     rec = {'epoch': epoch_idx, **{k: float(v) for k, v in mv.items() if isinstance(v, (int, float)) and k != 'epoch'}}
     for k, v in (ep_train or {}).items():
-        if k.startswith(('ab_', 'aux_', 'dpo_n_pairs_')) or k in ('dpo_n_cross_vanilla_excluded', 'final_loss'):
+        if k.startswith(('ab_', 'aux_', 'sched_', 'dpo_n_pairs_')) or k in ('dpo_n_cross_vanilla_excluded', 'final_loss'):
             try:
                 rec[f'train/{k}'] = float(v)
             except Exception:
@@ -3198,6 +3343,20 @@ def finetune(
                 print(f'[finetune vanilla] share {args.vanilla_share:.2f} on groups {_vs} (pairs never cross '
                       f'groups), 1 - share on the other groups, for DPO and SML; vanilla DPO '
                       f'{"plain pair mean" if args.vanilla_dpo_uniform else "type-weighted"}', flush=True)
+        # decoy scheduling: in-batch re-weighting of the comparisons that move the current pick
+        if bool(getattr(args, 'pair_sched', False)):
+            if not getattr(args, 'dpo_typed_pairs', False):
+                raise RuntimeError('--pair_sched needs --dpo_typed_pairs (the pair loss it re-weights)')
+            _ps = float(getattr(args, 'pair_sched_share', 0.0))
+            if not (0.0 < _ps < 1.0):
+                raise RuntimeError(f'--pair_sched_share must be in (0, 1), got {_ps}')
+            if int(getattr(args, 'pair_sched_topk', 1)) < 1:
+                raise RuntimeError('--pair_sched_topk must be >= 1')
+            if local_rank == 0:
+                print(f'[finetune decoy-sched] pair loss = {_ps:.2f} * mean(pairs whose lower-label side '
+                      f'is in the current top-{args.pair_sched_topk} of its group, label margin '
+                      f'>= {args.pair_sched_min_delta}) + {1 - _ps:.2f} * mean(rest); warmup '
+                      f'{args.pair_sched_warmup_epochs} epoch(s); SML unchanged', flush=True)
         # A/B arm B: the regression source, resolved by EXACT name (Boltz2_s10n10 != Boltz2)
         args._aux_reg_sid = None
         if getattr(args, 'aux_fv_reg', False):

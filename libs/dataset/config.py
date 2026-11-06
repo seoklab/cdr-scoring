@@ -124,6 +124,8 @@ class GraphBuildArgs:
     max_context_residues: int = 120
     graph_crop_debug: bool = False
     on_the_fly: bool = True             # skip caching for target_model_pickle (preserves random_range)
+    atom_graph: bool = False            # also store atom14 heavy-atom coords/mask per residue
+                                        # (side-chain atom encoder input; changes the cache generation)
 
 
 @dataclass

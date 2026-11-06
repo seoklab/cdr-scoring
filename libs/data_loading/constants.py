@@ -48,3 +48,17 @@ restype_name_to_atom14_names = {
 }
 ALL_NUM_ATOM = len(ATOM_TYPES) # := 36
 MAX_NUM_ATOM = len(restype_name_to_atom14_names['TRP']) # := 14
+
+# ── atom14 → ATOM_TYPES lookup (side-chain atom encoder) ──────────────────────
+# Row = AA3_IDX[resname], column = atom14 slot (0 N, 1 CA, 2 C, 3 O, 4 CB, 5.. side
+# chain). Value = index into ATOM_TYPES; 0 ('NONE') marks an unused slot. Derived
+# from restype_name_to_atom14_names so the two never drift apart.
+ATOM14_TYPE_IDX = [[0] * MAX_NUM_ATOM for _ in range(len(AA3_IDX))]
+for _resname, _names in restype_name_to_atom14_names.items():
+    _row = ATOM14_TYPE_IDX[AA3_IDX[_resname]]
+    for _slot, _name in enumerate(_names):
+        _row[_slot] = ATOM_ORDER.get(_name, 0) if _name else 0
+del _resname, _names, _row, _slot, _name
+
+# atom14 slots 0-3 are the backbone (N, CA, C, O); 4+ are CB and beyond.
+ATOM14_BACKBONE_SLOTS = 4

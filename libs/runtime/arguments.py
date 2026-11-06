@@ -237,6 +237,23 @@ PARSER.add_argument('--best_pool', type=str, default='boltz2',
 PARSER.add_argument('--aux_fv_reg', action='store_true', default=False,
                     help='Arm B: independent linear head on the pooled feature regressing the whole '
                          'Fv-context CDR-lDDT of --aux_reg_source candidates (eps-insensitive, FP32).')
+# ── side-chain branch: atom-level encoder in front of the residue trunk ──────
+PARSER.add_argument('--atom_encoder', action='store_true', default=False,
+                    help='Arm B: encode atom14 heavy atoms (side chains included) with a sparse '
+                         'atom attention block and add the per-residue pooling to the node embedding. '
+                         'Requires graph_build.atom_graph: true in the dataset YAML.')
+PARSER.add_argument('--atom_dim', type=int, default=32, help='Atom encoder feature width.')
+PARSER.add_argument('--atom_layers', type=int, default=2, help='Atom attention blocks.')
+PARSER.add_argument('--atom_heads', type=int, default=4, help='Atom attention heads.')
+PARSER.add_argument('--atom_radius', type=float, default=5.0,
+                    help='Atom-atom neighbour cutoff in Angstrom.')
+PARSER.add_argument('--atom_res_cutoff', type=float, default=8.0,
+                    help='Only residue pairs with CA-CA below this are expanded into atom pairs.')
+PARSER.add_argument('--atom_max_neighbors', type=int, default=24,
+                    help='Per-atom neighbour cap, nearest first.')
+PARSER.add_argument('--atom_lr_mult', type=float, default=10.0,
+                    help='Learning-rate multiplier for the freshly initialised atom encoder '
+                         '(the trunk is being fine-tuned, the encoder is training from scratch).')
 PARSER.add_argument('--aux_reg_source', type=str, default='Boltz2_s10n10',
                     help='Exact source name whose candidates get the regression target.')
 PARSER.add_argument('--aux_prep_epochs', type=int, default=1,
@@ -262,6 +279,26 @@ PARSER.add_argument('--wandb_require_online', action='store_true', default=False
 PARSER.add_argument('--vanilla_dpo_uniform', action='store_true', default=False,
                     help='fvctx DPO: vanilla pairs enter as a plain mean over pairs (no near/non type '
                          'weights), so the natural small-delta pairs are not down-weighted.')
+# ── decoy scheduling (2026-11-07): emphasise the comparisons that would change the current pick ──
+PARSER.add_argument('--pair_sched', action='store_true', default=False,
+                    help='In-batch selection-aware pair weighting. The scores of THIS forward pass '
+                         'decide which pairs matter: inside every pair group, a pair whose '
+                         'LOWER-label candidate is currently in the top --pair_sched_topk by model '
+                         'score is "selection-critical" (fixing it moves the group top1). The pair '
+                         'loss becomes share * mean(critical) + (1 - share) * mean(rest). Needs '
+                         '--dpo_typed_pairs. Off = byte-identical to the old behaviour.')
+PARSER.add_argument('--pair_sched_share', type=float, default=0.3,
+                    help='Share of the pair loss given to the selection-critical pairs (0-1). The '
+                         'split is skipped for a group that has none (the pick is already its best) '
+                         'or only critical pairs, so the loss scale never changes.')
+PARSER.add_argument('--pair_sched_topk', type=int, default=1,
+                    help='A pair counts as critical when its lower-label candidate is among the top '
+                         'K scoring candidates of its pair group. 1 = exactly the current pick.')
+PARSER.add_argument('--pair_sched_min_delta', type=float, default=0.0,
+                    help='Extra label margin a critical pair must clear (on top of '
+                         '--dpo_pair_min_delta): how much better the challenger has to be.')
+PARSER.add_argument('--pair_sched_warmup_epochs', type=int, default=0,
+                    help='Epochs at the start of training that run with the re-weighting off.')
 PARSER.add_argument('--dpo_policy_head', choices=['final', 'intrinsic'], default='final',
                     help='exp9: which head the DPO gradient trains. intrinsic is the '
                          'head test inference actually reads; exp6 trained `final` and '

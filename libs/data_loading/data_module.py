@@ -183,6 +183,7 @@ def graph_build_param_dict(spec, gb):
                        {k: list(v) for k, v in dict(cr).items()}) if not isinstance(cr, (list, tuple))
                       else [list(x) for x in cr],
         'task_scope': str(getattr(spec, 'task_scope', 'full_cdr')),
+        'atom_graph': bool(getattr(gb, 'atom_graph', False)),
     }
 
 # ── Lazy imports for YAML-driven pipeline (avoid import errors when not used) ──
@@ -843,6 +844,7 @@ class MyDataset(Dataset):
                     cdr_context_cutoff=gb.cdr_context_cutoff,
                     max_context_residues=gb.max_context_residues,
                     graph_crop_debug=gb.graph_crop_debug,
+                    atom_graph=getattr(gb, 'atom_graph', False),
                 )
                 if gp is None:
                     continue
@@ -2165,6 +2167,7 @@ class MyDataset(Dataset):
                                 graph_crop_debug=gb.graph_crop_debug,
                                 target_id=pdb_id,
                                 profile_timings=data_profile if profile_data_loading else None,
+                                atom_graph=getattr(gb, 'atom_graph', False),
                             )
                             dist_cutoff = gb.dist_cutoff_center
                             # Manifest (fixed-eval) mode keeps the cutoff deterministic
