@@ -358,6 +358,7 @@ class MyDataset(Dataset):
                     root=pm.root,
                     source_subdirs=pm.sources,
                     metrics_filename=pm.metrics_filename,
+                    column_alias=getattr(pm, 'column_alias', None),
                 )
                 _logging.debug(
                     'MyDataset: precomputed metrics enabled (root=%s, require=%s)',
@@ -1551,44 +1552,275 @@ class MyDataset(Dataset):
                     return "C"
                 return "D"
 
-            tier_to_ii: dict = {"X": [], "A": [], "B": [], "C": [], "D": []}
-            for i, (sname, idx, rmsd) in enumerate(pool):
-                if i in topup_only_ii:
-                    continue          # gate-dropped: Step 5 only, never the quotas
-                tier_to_ii[_tier(rmsd)].append(i)
+            _bins = getattr(spec, "sampler_bins", None)
+            if getattr(spec, "sampler_mode", None) == "parts":
+                # ── fixed per-source composition (fvctx DPO runs) ──
+                _parts = getattr(spec, "sampler_parts", None) or []
 
-            selected_ii = set()
-            # Step 1: crystal (native) inclusion is probability-gated and annealed
-            # over training via spec.xtal_gate_prob (ScheduleSpec resolved at this
-            # epoch). Early epochs keep the native as a positive anchor (prob ~1.0);
-            # final-stage epochs drop it (prob ~0.0) so the model must discriminate
-            # among model-generated decoys. When excluded, tier-X is also held out
-            # of the random fill below so no crystal sneaks in.
-            xtal_prob = spec.effective_xtal_prob(epoch)
-            include_xtal = bool(tier_to_ii["X"]) and (rng.random() < xtal_prob)
-            if include_xtal:
-                selected_ii.add(rng.choice(tier_to_ii["X"]))
-            # Step 2: quota per tier (without replacement).
-            # tier-X (native) counts toward the A quota, so an included crystal
-            # reduces the number of A-tier decoys drawn by one.
-            _n_x_sel = 1 if include_xtal else 0
-            for tier_key, quota in [("A", max(0, _Q_A - _n_x_sel)), ("B", _Q_B), ("C", _Q_C), ("D", _Q_D)]:
-                available = [i for i in tier_to_ii[tier_key] if i not in selected_ii]
-                k = min(quota, len(available))
-                if k > 0:
-                    for ii in _wsample(available, k, rng):
+                def _pkey(j):
+                    sname_, idx_ = pool[j][0], pool[j][1]
+                    if sname_ != "Boltz2_pdiff":
+                        return None
+                    keys_ = per_source_keys.get(sname_) or []
+                    return (sname_, keys_[idx_][0]) if idx_ < len(keys_) else None
+
+                def _pspread(ii, k):
+                    if k <= 0 or not ii:
+                        return []
+                    ii = sorted(ii, key=lambda j: pool[j][2])
+                    if len(ii) <= k:
+                        return list(ii)
+                    lo_, hi_ = pool[ii[0]][2], pool[ii[-1]][2]
+                    w_ = (hi_ - lo_) / k
+                    chosen, used, usedkey = [], set(), set()
+                    for q in range(k):
+                        m_ = lo_ + w_ * (q + rng.random())
+                        best, bd = None, None
+                        for allow_dup in (False, True):
+                            for j in ii:
+                                if j in used:
+                                    continue
+                                kk = _pkey(j)
+                                if not allow_dup and kk is not None and kk in usedkey:
+                                    continue
+                                d_ = abs(pool[j][2] - m_)
+                                if bd is None or d_ < bd:
+                                    best, bd = j, d_
+                            if best is not None:
+                                break
+                        if best is None:
+                            break
+                        chosen.append(best)
+                        used.add(best)
+                        kk = _pkey(best)
+                        if kk is not None:
+                            usedkey.add(kk)
+                    return chosen
+
+                part_ii = []
+                for _pt in _parts:
+                    _ss = set(_pt.get("sources", []))
+                    part_ii.append([i for i, (sname, idx, lab) in enumerate(pool)
+                                    if i not in topup_only_ii and sname in _ss and lab == lab])
+                selected_ii = set()
+                for _pt, ii in zip(_parts, part_ii):       # fixed-size parts first
+                    _k = _pt.get("k", "rest")
+                    if _k == "rest":
+                        continue
+                    _n = len(ii) if _k == "all" else int(_k)
+                    _n = min(_n, int(_pt.get("cap", _n)))
+                    for j in _pspread([i for i in ii if i not in selected_ii], _n):
+                        selected_ii.add(j)
+                for _pt, ii in zip(_parts, part_ii):       # then the rest, in order
+                    if _pt.get("k", "rest") != "rest":
+                        continue
+                    remaining = n_decoy_target - len(selected_ii)
+                    for j in _pspread([i for i in ii if i not in selected_ii], max(0, remaining)):
+                        selected_ii.add(j)
+                # still short (small parts): top up from every part's leftovers
+                remaining = n_decoy_target - len(selected_ii)
+                if remaining > 0:
+                    left = sorted({i for ii in part_ii for i in ii} - selected_ii)
+                    for j in _pspread(left, remaining):
+                        selected_ii.add(j)
+                if not selected_ii:
+                    if not inference_yaml and len(self.inp_dat) > 1 and _depth < 50:
+                        alt_idx = random.randint(0, len(self.inp_dat) - 1)
+                        return self._getitem_yaml(self.inp_dat[alt_idx], _depth + 1)
+                    raise FileNotFoundError(f"No decoys for {pdb_id} in sampler_parts")
+                tier_to_ii = {"X": []}
+            elif getattr(spec, "sampler_mode", None) == "source_blocks":
+                # ── pair-loss source blocks (fvctx_pair) ──
+                import numpy as np
+                _groups = getattr(spec, "pair_groups", None) or {s_: [s_] for s_ in per_source}
+                _src2grp = {s_: g_ for g_, ss_ in _groups.items() for s_ in ss_}
+                _gprob = getattr(spec, "pair_group_probs", None) or {}
+                _bs = int(getattr(spec, "block_size", 32) or 32)
+                _tc = float(getattr(spec, "block_top_cut", 0.90))
+                _tq = int(getattr(spec, "block_top_quota", 16))
+                _md = float(getattr(spec, "pair_min_delta", 0.02))
+                _mp = int(getattr(spec, "pair_min_pairs", 20))
+                by_g = {}
+                for i, (sname, idx, lab) in enumerate(pool):
+                    if i in topup_only_ii:
+                        continue
+                    g_ = _src2grp.get(sname)
+                    if g_ is None or lab != lab:
+                        continue
+                    by_g.setdefault(g_, []).append(i)
+
+                def _n_pairs(ii):
+                    v = np.sort(np.asarray([pool[k][2] for k in ii], dtype=float))
+                    j = np.searchsorted(v, v + _md - 1e-12, side="left")
+                    return int((len(v) - j).sum())
+
+                eligible = sorted(g_ for g_, ii in by_g.items() if len(ii) >= 2 and _n_pairs(ii) >= _mp)
+                if not eligible:
+                    if not inference_yaml and len(self.inp_dat) > 1 and _depth < 50:
+                        _logging.info("_getitem_yaml: %s has no eligible pair group; another target", pdb_id)
+                        alt_idx = random.randint(0, len(self.inp_dat) - 1)
+                        return self._getitem_yaml(self.inp_dat[alt_idx], _depth + 1)
+                    raise FileNotFoundError(f"No eligible pair group for {pdb_id}")
+                # groups: weighted sampling without replacement (Efraimidis-Spirakis)
+                _keyed = sorted(((rng.random() ** (1.0 / max(1e-9, float(_gprob.get(g_, 1.0)))), g_)
+                                 for g_ in eligible), reverse=True)
+                n_blocks = 2 if len(eligible) >= 2 else 1
+                picked_groups = [g_ for _, g_ in _keyed[:n_blocks]]
+                size = n_decoy_target // n_blocks
+
+                def _dkey(j):
+                    sname_, idx_ = pool[j][0], pool[j][1]
+                    if sname_ != "Boltz2_pdiff":
+                        return None
+                    keys_ = per_source_keys.get(sname_) or []
+                    return (sname_, keys_[idx_][0]) if idx_ < len(keys_) else None
+
+                def _spread(ii, k):
+                    """k decoys spread over the label range of ii (one random mark per
+                    equal-width slice), no repeated pdiff seed while others remain."""
+                    if k <= 0 or not ii:
+                        return []
+                    ii = sorted(ii, key=lambda j: pool[j][2])
+                    if len(ii) <= k:
+                        return list(ii)
+                    lo_, hi_ = pool[ii[0]][2], pool[ii[-1]][2]
+                    w_ = (hi_ - lo_) / k
+                    chosen, used, usedkey = [], set(), set()
+                    for q in range(k):
+                        m_ = lo_ + w_ * (q + rng.random())
+                        best, bd = None, None
+                        for allow_dup in (False, True):
+                            for j in ii:
+                                if j in used:
+                                    continue
+                                kk = _dkey(j)
+                                if not allow_dup and kk is not None and kk in usedkey:
+                                    continue
+                                d_ = abs(pool[j][2] - m_)
+                                if bd is None or d_ < bd:
+                                    best, bd = j, d_
+                            if best is not None:
+                                break
+                        if best is None:
+                            break
+                        chosen.append(best)
+                        used.add(best)
+                        kk = _dkey(best)
+                        if kk is not None:
+                            usedkey.add(kk)
+                    return chosen
+
+                # block sizes: block_size each; a group with fewer decoys hands its
+                # unused slots to the other block, so the target still gets n_decoy
+                # whenever the picked groups hold that many.
+                avail = [len(by_g[g_]) for g_ in picked_groups]
+                alloc = [min(size, a_) for a_ in avail]
+                spare = n_decoy_target - sum(alloc)
+                for b_ in range(len(alloc)):
+                    if spare <= 0:
+                        break
+                    add = min(spare, avail[b_] - alloc[b_])
+                    alloc[b_] += add
+                    spare -= add
+                selected_ii = set()
+                for g_, a_ in zip(picked_groups, alloc):
+                    ii = by_g[g_]
+                    top = [i for i in ii if pool[i][2] >= _tc]
+                    rest = [i for i in ii if pool[i][2] < _tc]
+                    # top share of a block = block_top_quota / block_size (16/32)
+                    k_top = min(len(top), int(round(a_ * _tq / max(1, _bs))))
+                    k_rest = min(len(rest), a_ - k_top)
+                    k_top = min(len(top), a_ - k_rest)        # rest short -> more top
+                    for j in _spread(top, k_top) + _spread(rest, k_rest):
+                        selected_ii.add(j)
+                tier_to_ii = {"X": []}
+            elif _bins:
+                # ── configurable bins (e.g. fvctx_sml) ──
+                # Step 1 crystal (by source, prob-gated), Step 2 per-bin quota
+                # (k = min(quota, available)), Step 3 remaining slots filled from
+                # sampler_fill_order bins in order. Bins outside the fill order with
+                # quota 0 (a dead band) never enter, so a target may get < n_decoy.
+                _bins_sorted = sorted(_bins, key=lambda b: -float(b["lo"]))
+
+                def _bin_of(r):
+                    for _b in _bins_sorted:
+                        if r >= float(_b["lo"]):
+                            return str(_b["name"])
+                    return str(_bins_sorted[-1]["name"])
+
+                tier_to_ii = {"X": [], **{str(b["name"]): [] for b in _bins_sorted}}
+                for i, (sname, idx, rmsd) in enumerate(pool):
+                    if i in topup_only_ii:
+                        continue
+                    if sname == "Xtal":
+                        tier_to_ii["X"].append(i)
+                        continue
+                    tier_to_ii[_bin_of(rmsd)].append(i)
+                selected_ii = set()
+                xtal_prob = spec.effective_xtal_prob(epoch)
+                include_xtal = bool(tier_to_ii["X"]) and (rng.random() < xtal_prob)
+                if include_xtal:
+                    selected_ii.add(rng.choice(tier_to_ii["X"]))
+                _n_x_sel = 1 if include_xtal else 0
+                _xbin = getattr(spec, "sampler_xtal_bin", None)
+                for _b in _bins_sorted:
+                    _q = _b.get("quota", 0)
+                    if isinstance(_q, str):      # "rest": filled in step 3 only
+                        continue
+                    _q = int(_q) - (_n_x_sel if str(_b["name"]) == _xbin else 0)
+                    available = [i for i in tier_to_ii[str(_b["name"])] if i not in selected_ii]
+                    k = min(max(0, _q), len(available))
+                    if k > 0:
+                        for ii in _wsample(available, k, rng):
+                            selected_ii.add(ii)
+                for _name in (getattr(spec, "sampler_fill_order", None) or []):
+                    remaining = n_decoy_target - len(selected_ii)
+                    if remaining <= 0:
+                        break
+                    available = [i for i in tier_to_ii.get(str(_name), []) if i not in selected_ii]
+                    k = min(remaining, len(available))
+                    if k > 0:
+                        for ii in _wsample(available, k, rng):
+                            selected_ii.add(ii)
+            else:
+                tier_to_ii: dict = {"X": [], "A": [], "B": [], "C": [], "D": []}
+                for i, (sname, idx, rmsd) in enumerate(pool):
+                    if i in topup_only_ii:
+                        continue          # gate-dropped: Step 5 only, never the quotas
+                    tier_to_ii[_tier(rmsd)].append(i)
+
+                selected_ii = set()
+                # Step 1: crystal (native) inclusion is probability-gated and annealed
+                # over training via spec.xtal_gate_prob (ScheduleSpec resolved at this
+                # epoch). Early epochs keep the native as a positive anchor (prob ~1.0);
+                # final-stage epochs drop it (prob ~0.0) so the model must discriminate
+                # among model-generated decoys. When excluded, tier-X is also held out
+                # of the random fill below so no crystal sneaks in.
+                xtal_prob = spec.effective_xtal_prob(epoch)
+                include_xtal = bool(tier_to_ii["X"]) and (rng.random() < xtal_prob)
+                if include_xtal:
+                    selected_ii.add(rng.choice(tier_to_ii["X"]))
+                # Step 2: quota per tier (without replacement).
+                # tier-X (native) counts toward the A quota, so an included crystal
+                # reduces the number of A-tier decoys drawn by one.
+                _n_x_sel = 1 if include_xtal else 0
+                for tier_key, quota in [("A", max(0, _Q_A - _n_x_sel)), ("B", _Q_B), ("C", _Q_C), ("D", _Q_D)]:
+                    available = [i for i in tier_to_ii[tier_key] if i not in selected_ii]
+                    k = min(quota, len(available))
+                    if k > 0:
+                        for ii in _wsample(available, k, rng):
+                            selected_ii.add(ii)
+                # Step 3–4: remaining from pool (never pull extra / un-gated crystals)
+                xtal_ii = set(tier_to_ii["X"])
+                remaining = n_decoy_target - len(selected_ii)
+                unselected_ii = [
+                    i for i in range(len(pool))
+                    if i not in selected_ii and i not in xtal_ii and i not in topup_only_ii
+                ]
+                if remaining > 0 and unselected_ii:
+                    k = min(remaining, len(unselected_ii))
+                    for ii in _wsample(unselected_ii, k, rng):
                         selected_ii.add(ii)
-            # Step 3–4: remaining from pool (never pull extra / un-gated crystals)
-            xtal_ii = set(tier_to_ii["X"])
-            remaining = n_decoy_target - len(selected_ii)
-            unselected_ii = [
-                i for i in range(len(pool))
-                if i not in selected_ii and i not in xtal_ii and i not in topup_only_ii
-            ]
-            if remaining > 0 and unselected_ii:
-                k = min(remaining, len(unselected_ii))
-                for ii in _wsample(unselected_ii, k, rng):
-                    selected_ii.add(ii)
 
             # ── exp4-1 "cell importance sampler" ────────────────────────────
             # A different regime from Step 5b: no gate, no top-up. ALL slots are

@@ -63,11 +63,27 @@ def finalize_epoch_loss(epoch_loss):
         #else:
         epoch_loss[key]=torch.Tensor(epoch_loss[key]).mean(dim=0).cuda()
     return epoch_loss
+def _epoch_log_path(out_tag, mode):
+    """<code root>/log/<out_tag>.<mode>.log, whatever the working directory.
+
+    CDR_LOG_DIR overrides the directory; an out_tag that already contains a
+    directory is used as given.
+    """
+    name = '%s.%s.log' % (out_tag, mode)
+    if os.path.dirname(out_tag):
+        return name
+    log_dir = os.environ.get('CDR_LOG_DIR') or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log')
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, name)
+
+
 def report_epoch_loss(epoch_loss,epoch_idx,mode,out_tag=None):
     if out_tag==None:
         out_tag='default'
-    if os.path.exists('%s.%s.log'%(out_tag,mode)):
-        with open('%s.%s.log'%(out_tag,mode)) as fp:
+    log_path = _epoch_log_path(out_tag, mode)
+    if os.path.exists(log_path):
+        with open(log_path) as fp:
             wrt=fp.readlines()
     else:
         header='%10i '%epoch_idx
@@ -83,7 +99,7 @@ def report_epoch_loss(epoch_loss,epoch_idx,mode,out_tag=None):
         sen+='%10.3f '%epoch_loss[key].tolist()
     sen+='\n'
     wrt.append(sen)
-    with open('%s.%s.log'%(out_tag,mode),'wt') as fp:
+    with open(log_path,'wt') as fp:
         fp.writelines(wrt)
 def _aggregate_finite(vals, prefix, out):
     """Add mean/median for finite values to *out*."""

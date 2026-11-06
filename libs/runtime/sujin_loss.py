@@ -2189,6 +2189,36 @@ class TierDPOLoss:
         ]
         return self._pairwise_dpo(pi_scores, ref_scores, top_pairs, device, higher_is_better)
 
+    def dpo_typed_loss(self, pi_scores, ref_scores, pos_idx, neg_idx, types, type_weights, device):
+        """fvctx DPO: per-type mean DPO loss, weighted over the pair types present.
+
+        ``pos_idx``/``neg_idx``: LongTensors (positive = higher label); ``types``:
+        LongTensor 0 near-near, 1 near-non, 2 non-non. Higher score = better.
+        Returns (loss, {type: n_pairs}).
+        """
+        n_by = {t: int((types == t).sum()) for t in range(3)}
+        if pos_idx.numel() == 0:
+            return torch.tensor(0.0, device=device), n_by
+        margin_pi = pi_scores[pos_idx] - pi_scores[neg_idx]
+        margin_ref = (ref_scores[pos_idx] - ref_scores[neg_idx]).detach()
+        lp = -F.logsigmoid(self.beta * (margin_pi - margin_ref))
+        present = [t for t in range(3) if n_by[t] > 0]
+        wsum = sum(float(type_weights[t]) for t in present) or 1.0
+        loss = sum(float(type_weights[t]) / wsum * lp[types == t].mean() for t in present)
+        return loss, n_by
+
+    def dpo_pair_mean_loss(self, pi_scores, ref_scores, pos_idx, neg_idx, device):
+        """fvctx vanilla fine-tune: plain mean DPO loss over the given pairs (no type weights).
+
+        Every pair counts once, so the label-difference mix of the pairs is the mix the
+        generator produced. Returns 0 when there are no pairs.
+        """
+        if pos_idx.numel() == 0:
+            return torch.tensor(0.0, device=device)
+        margin_pi = pi_scores[pos_idx] - pi_scores[neg_idx]
+        margin_ref = (ref_scores[pos_idx] - ref_scores[neg_idx]).detach()
+        return (-F.logsigmoid(self.beta * (margin_pi - margin_ref))).mean()
+
     def dpo_within_loss(self, pi_scores, ref_scores, pairs, device, higher_is_better=False):
         """exp6: ranking pressure between two decoys in the SAME cdr_lddt tier.
 
@@ -2312,3 +2342,58 @@ class OrdinalH3LddtAuxLoss(nn.Module):
         mono_penalty = (F.relu(p90 - p80) + F.relu(p80 - p60)).mean()
 
         return loss_aux_ord, mono_penalty, n_valid
+
+class PairBlockLoss(nn.Module):
+    """Within-group pairwise logistic loss for the fvctx_pair runs.
+
+    Pairs = every two decoys of the SAME pair group (``group`` per decoy; -1 =
+    unusable) whose labels differ by >= ``min_delta``; each pair has weight 1 and
+    loss softplus(-(s_hi - s_lo)). ``top_share`` of the target's loss comes from
+    the pairs where BOTH decoys have label >= ``top_cut`` (ordering among good
+    structures) and the rest from the other pairs; a target with only one kind
+    uses that kind alone. Higher label = better.
+    """
+
+    def __init__(self, min_delta=0.02, top_cut=0.90, top_share=0.5):
+        super().__init__()
+        self.min_delta = float(min_delta)
+        self.top_cut = float(top_cut)
+        self.top_share = float(top_share)
+
+    def forward(self, pred, label, group):
+        s = pred.reshape(-1).float()
+        y = label.reshape(-1).float().to(s.device)
+        g = group.reshape(-1).to(s.device).long()
+        n = s.numel()
+        zero = s.sum() * 0.0
+        stats = {'pair_n_top': 0.0, 'pair_n_rest': 0.0, 'pair_acc_top': 0.0, 'pair_acc_rest': 0.0,
+                 'pair_loss_top': 0.0, 'pair_loss_rest': 0.0}
+        if n < 2 or y.numel() != n or g.numel() != n:
+            return zero, stats
+        ok = torch.isfinite(y) & (g >= 0)
+        i, j = torch.triu_indices(n, n, 1, device=s.device)
+        d = y[i] - y[j]
+        m = ok[i] & ok[j] & (g[i] == g[j]) & (d.abs() >= self.min_delta)
+        if not bool(m.any()):
+            return zero, stats
+        i, j, d = i[m], j[m], d[m]
+        margin = (s[i] - s[j]) * torch.sign(d)
+        lp = F.softplus(-margin)
+        top = torch.minimum(y[i], y[j]) >= self.top_cut
+        has_t, has_r = bool(top.any()), bool((~top).any())
+        if has_t and has_r:
+            loss = self.top_share * lp[top].mean() + (1.0 - self.top_share) * lp[~top].mean()
+        elif has_t:
+            loss = lp[top].mean()
+        else:
+            loss = lp[~top].mean()
+        with torch.no_grad():
+            stats['pair_n_top'] = float(top.sum())
+            stats['pair_n_rest'] = float((~top).sum())
+            if has_t:
+                stats['pair_acc_top'] = float((margin[top] > 0).float().mean())
+                stats['pair_loss_top'] = float(lp[top].mean())
+            if has_r:
+                stats['pair_acc_rest'] = float((margin[~top] > 0).float().mean())
+                stats['pair_loss_rest'] = float(lp[~top].mean())
+        return loss, stats

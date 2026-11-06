@@ -80,7 +80,9 @@ class LRSchedulerCallback(BaseCallback):
 
     def on_epoch_end(self,loss=None):
         if self.logger is not None:
-            self.logger.log_metrics({'learning rate': self.scheduler.get_last_lr()[0]}, step=self.scheduler.last_epoch)
+            # no step=: WandbLogger turns step into an 'epoch' key, and last_epoch is one behind,
+            # which overwrote the epoch axis of the run
+            self.logger.log_metrics({'learning rate': self.scheduler.get_last_lr()[0]})
         if not loss==None:
             self.scheduler.step(metrics=loss)
         else:
@@ -245,7 +247,8 @@ class QM9LRSchedulerCallback(LRSchedulerCallback):
             for pg in optimizer.param_groups:
                 pg['lr'] = min_lr
             return CosineAnnealingWarmUpRestarts(
-                optimizer, T_0=200, eta_max=args.learning_rate, T_up=10, gamma=0.75
+                optimizer, T_0=int(getattr(args, 'sch_T0', 200) or 200), eta_max=args.learning_rate,
+                T_up=int(getattr(args, 'lr_warmup_epochs', 10)), gamma=0.75
             )
         #return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, self.epochs, eta_min=min_lr)
 

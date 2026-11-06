@@ -54,6 +54,9 @@ optimizer = PARSER.add_argument_group('Optimizer')
 optimizer.add_argument('--optimizer', choices=['adam', 'sgd', 'lamb'], default='adam')
 optimizer.add_argument('--learning_rate', '--lr', dest='learning_rate', type=float, default=0.002)
 optimizer.add_argument('--min_learning_rate', '--min_lr', dest='min_learning_rate', type=float, default=None)
+optimizer.add_argument('--lr_warmup_epochs', type=int, default=10,
+                       help='cosine scheduler warm-up epochs (T_up). 0 = start at --learning_rate '
+                            '(epoch 1 otherwise trains at min_lr, ~1e-7).')
 optimizer.add_argument('--momentum', type=float, default=0.9)
 optimizer.add_argument('--weight_decay', type=float, default=0.1)
 
@@ -63,7 +66,7 @@ PARSER.add_argument('--seed', type=int, default=None, help='Set a seed globally'
 PARSER.add_argument('--num_workers', type=int, default=8, help='Number of dataloading workers')
 
 PARSER.add_argument('--loss_type', type=str, nargs='?', const=True, default='sml', help='Sujin Loss Type')
-PARSER.add_argument('--label_metric', type=str, default=None, choices=['loop_rmsd', 'loop_lddt'],
+PARSER.add_argument('--label_metric', type=str, default=None, choices=['loop_rmsd', 'loop_lddt', 'fv_context_lddt'],
                     help='Training label / ranking metric. loop_rmsd=lower-is-better (default), '
                          'loop_lddt=higher-is-better. When set, overrides the YAML label_metric AND '
                          'flips loss/ranking/tier direction accordingly. None = use the value in the dataset YAML.')
@@ -200,6 +203,65 @@ PARSER.add_argument('--dpo_top_min_delta_relaxed', type=float, default=0.03,
                     help='exp9: fallback threshold for targets that cannot fill the '
                          'budget at --dpo_top_min_delta (81%% of train targets have a '
                          '>=0.05 top pair, 92%% have a >=0.03 one).')
+PARSER.add_argument('--dpo_typed_pairs', action='store_true', default=False,
+                    help='fvctx DPO: every same-group pair with |d label| >= --dpo_pair_min_delta over '
+                         'the full label range (groups = YAML pair_groups), typed near-near / near-non / '
+                         'non-non by --dpo_near_cut; loss = per-type mean DPO weighted by --dpo_type_weights.')
+PARSER.add_argument('--dpo_near_cut', type=float, default=0.85,
+                    help='fvctx DPO: label >= this is "near" for pair typing (0.85-0.90 counts as near).')
+PARSER.add_argument('--dpo_type_weights', type=str, default='0.45,0.45,0.10',
+                    help='fvctx DPO: weights of near-near, near-non, non-non pairs (renormalised over '
+                         'the types present in a target).')
+PARSER.add_argument('--dpo_pair_max', type=int, default=0,
+                    help='fvctx DPO: cap on pairs per target (0 = no cap); a capped target keeps each '
+                         'type in proportion.')
+# ── fvctx vanilla fine-tune (2026-10-22): supervision centred on vanilla-vs-vanilla pairs ──
+PARSER.add_argument('--vanilla_share', type=float, default=0.0,
+                    help='fvctx DPO: > 0 splits BOTH the DPO and the SML term into the --vanilla_group '
+                         'decoys (weight w) and every other group (weight 1 - w). Vanilla decoys are then '
+                         'never compared with decoys of other groups. 0 = off (old behaviour).')
+PARSER.add_argument('--vanilla_group', type=str, default='Boltz2_vanilla',
+                    help='fvctx DPO: YAML pair_groups name(s), comma-separated, holding the vanilla '
+                         'generator decoys. Several groups share the vanilla weight, but DPO pairs '
+                         'still never cross groups (e.g. Boltz2_s10n10,Boltz2_full).')
+# ── A/B protocol for the s10n10 aux-regression experiment (2026-10-23) ──
+PARSER.add_argument('--ab_protocol', action='store_true', default=False,
+                    help='Finetune protocol shared by the A/B runs: strict checkpoint-key check, epoch-0 '
+                         'manifest validation, RNG re-seed + fresh optimizer/scheduler right before joint '
+                         'training, best/last checkpoints, STOP file. Needs a single process (no DDP).')
+PARSER.add_argument('--sch_T0', type=int, default=200,
+                    help='Cosine scheduler period in epochs (CosineAnnealingWarmUpRestarts T_0).')
+PARSER.add_argument('--best_pool', type=str, default='boltz2',
+                    help='ab_protocol: manifest pool whose intrinsic top1 picks the primary best checkpoint '
+                         '(ties broken by its gen_pair_acc).')
+PARSER.add_argument('--aux_fv_reg', action='store_true', default=False,
+                    help='Arm B: independent linear head on the pooled feature regressing the whole '
+                         'Fv-context CDR-lDDT of --aux_reg_source candidates (eps-insensitive, FP32).')
+PARSER.add_argument('--aux_reg_source', type=str, default='Boltz2_s10n10',
+                    help='Exact source name whose candidates get the regression target.')
+PARSER.add_argument('--aux_prep_epochs', type=int, default=1,
+                    help='Head-only preparation epochs (backbone + existing heads frozen, eval mode).')
+PARSER.add_argument('--aux_prep_lr', type=float, default=1e-3,
+                    help='Adam learning rate of the head-only preparation.')
+PARSER.add_argument('--aux_lambda_batches', type=int, default=64,
+                    help='Training batches used to calibrate lambda_reg from gradient norms.')
+PARSER.add_argument('--aux_lambda_frac', type=float, default=0.1,
+                    help='lambda_reg = frac * median|g_main| / median|g_aux| on the shared backbone.')
+PARSER.add_argument('--aux_lambda', type=float, default=None,
+                    help='Fixed lambda_reg (skips the calibration; for resumes/tests only).')
+PARSER.add_argument('--aux_grad_probe_steps', type=str, default='1,10,50,100,200,500,1000',
+                    help='Joint-training steps at which the actual |g_aux|/|g_main| ratio is measured.')
+PARSER.add_argument('--aux_grad_probe_every', type=int, default=1000,
+                    help='...and every this many joint steps after the last listed one.')
+PARSER.add_argument('--wandb_entity', type=str, default=None)
+PARSER.add_argument('--wandb_project', type=str, default='se3-transformer')
+PARSER.add_argument('--wandb_group', type=str, default=None)
+PARSER.add_argument('--wandb_job_type', type=str, default=None)
+PARSER.add_argument('--wandb_require_online', action='store_true', default=False,
+                    help='Abort instead of falling back to offline logging when W&B cannot be reached.')
+PARSER.add_argument('--vanilla_dpo_uniform', action='store_true', default=False,
+                    help='fvctx DPO: vanilla pairs enter as a plain mean over pairs (no near/non type '
+                         'weights), so the natural small-delta pairs are not down-weighted.')
 PARSER.add_argument('--dpo_policy_head', choices=['final', 'intrinsic'], default='final',
                     help='exp9: which head the DPO gradient trains. intrinsic is the '
                          'head test inference actually reads; exp6 trained `final` and '
@@ -268,6 +330,9 @@ PARSER.add_argument('--val_manifest_multisource', type=str, default=None,
                     help='Path to the fixed multi-source antibody-antigen validation manifest (JSON).')
 PARSER.add_argument('--val_manifest_boltz2', type=str, default=None,
                     help='Path to the fixed Boltz2-only validation manifest (JSON).')
+PARSER.add_argument('--val_manifest_controlled', type=str, default=None,
+                    help='Path to the fixed controlled validation manifest (JSON; Boltz2_pdiff decoys, '
+                         'target-wise low/intermediate/high), logged under val/controlled/.')
 PARSER.add_argument('--manifest_val_interval', type=int, default=1,
                     help='Run the fixed-manifest validation every N epochs (it rebuilds '
                          'graphs on the fly, so it is expensive). 0/1 = every epoch.')

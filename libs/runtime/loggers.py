@@ -22,6 +22,7 @@
 # SPDX-License-Identifier: MIT
 
 import pathlib
+import time
 import json
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -134,19 +135,62 @@ class WandbLogger(Logger):
             name: str,
             save_dir: pathlib.Path,
             id: Optional[str] = None,
-            project: Optional[str] = None
+            project: Optional[str] = None,
+            entity: Optional[str] = None,
+            group: Optional[str] = None,
+            job_type: Optional[str] = None,
+            config: Optional[Dict[str, Any]] = None,
+            require_online: bool = False,
     ):
         super().__init__()
         if wandb is None:
             raise ModuleNotFoundError("wandb is required when --wandb true")
         if not dist.is_initialized() or dist.get_rank() == 0:
             save_dir.mkdir(parents=True, exist_ok=True)
-            self.experiment = wandb.init(name=name,
-                                         project=project,
-                                         id=id,
-                                         dir=str(save_dir),
-                                         resume='allow',
-                                         anonymous='must')
+            # A wandb server error at init (2026-10-22: CommError "'NoneType' object has no
+            # attribute 'get'" in send_run, wandb 0.16.6 vs a server without the ServerSettings
+            # type) used to kill the job before the first step. Retry; then either abort
+            # (require_online) or fall back to offline logging (sync later with `wandb sync`).
+            kw = dict(name=name, project=project, id=id, dir=str(save_dir), resume='allow')
+            for k, v in (('entity', entity), ('group', group), ('job_type', job_type), ('config', config)):
+                if v is not None:
+                    kw[k] = v
+            self.experiment = None
+            last_err = None
+            for attempt in range(3):
+                try:
+                    self.experiment = wandb.init(**kw)
+                    break
+                except Exception as e:  # wandb raises CommError / UsageError / timeouts
+                    last_err = e
+                    print(f'[wandb] init failed (attempt {attempt + 1}/3): {type(e).__name__}: {e}', flush=True)
+                    try:
+                        wandb.finish()
+                    except Exception:
+                        pass
+                    time.sleep(60)
+            if self.experiment is None:
+                if require_online:
+                    raise RuntimeError(f'[wandb] online init failed 3x and --wandb_require_online is set: {last_err}')
+                print('[wandb] falling back to offline mode (sync later with `wandb sync <run dir>`)', flush=True)
+                self.experiment = wandb.init(mode='offline', **kw)
+            _mode = getattr(getattr(self.experiment, 'settings', None), 'mode', 'online')
+            if require_online and _mode != 'online':
+                raise RuntimeError(f'[wandb] run is not online (mode={_mode}) and --wandb_require_online is set')
+            print(f'[wandb] run {self.experiment.id} mode={_mode} url={getattr(self.experiment, "url", None)}',
+                  flush=True)
+            # separate x-axes: head-only prep and joint steps never collide with epochs
+            try:
+                r = self.experiment
+                r.define_metric('epoch')
+                r.define_metric('prep/step')
+                r.define_metric('prep/*', step_metric='prep/step')
+                r.define_metric('joint/step')
+                r.define_metric('joint/*', step_metric='joint/step')
+                for pat in ('train/*', 'valid/*', 'val/*', 'best/*', 'calib/*', 'loss/*'):
+                    r.define_metric(pat, step_metric='epoch')
+            except Exception as e:
+                print(f'[wandb] define_metric failed: {e}', flush=True)
 
     @rank_zero_only
     def log_hyperparams(self, params: Dict[str, Any]) -> None:

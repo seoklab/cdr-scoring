@@ -48,6 +48,9 @@ _METRIC_COLUMN = {
     "h3_lddt": "H3_loop_lddt",
     "dockq": "dockq",   # validation-only (CAPRI classification of the top-1 decoy)
     "fnat": "fnat",     # interface head label (native antibody-antigen contact fraction)
+    # Fv-context CDR-lDDT: CDR backbone scored against CDR + non-CDR Fv partners only
+    # (no antigen, no constant domains); sibling parquet fv_context_metrics.parquet.
+    "fv_context_lddt": "fv_context_cdr_lddt",
 }
 
 
@@ -148,10 +151,16 @@ class PrecomputedMetricStore:
         root: str,
         source_subdirs: Optional[Dict[str, str]] = None,
         metrics_filename: str = "metrics/loop_metrics.parquet",
+        column_alias: Optional[Dict[str, Dict[str, str]]] = None,
     ):
         self.root = root
         self.source_subdirs = dict(source_subdirs or {})
         self.metrics_filename = metrics_filename
+        # {source_name: {requested column: column actually read}}, e.g. GP has no
+        # Fv-context parquet, so {"GP": {"fv_context_cdr_lddt": "cdr_lddt"}} keeps
+        # its loop lDDT label under an Fv-context run. Explicit per source on
+        # purpose: a missing Fv parquet of an antibody source must stay NaN.
+        self.column_alias = {k: dict(v or {}) for k, v in (column_alias or {}).items()}
         # source_name -> {(target_id, seed, sample): {column: value}}
         self._tables: Dict[str, Dict[Tuple[str, Optional[int], int], Dict[str, float]]] = {}
         self._loaded: Dict[str, bool] = {}
@@ -259,6 +268,28 @@ class PrecomputedMetricStore:
             except Exception:
                 logger.exception("PrecomputedMetricStore: failed to read interface parquet %s", iface_path)
 
+        # Merge Fv-context CDR-lDDT (and the H3 Fv-context lDDT) from the sibling
+        # fv_context parquet, same identity key. Absent (e.g. GP) -> stays NaN.
+        fv_path = path.replace("loop_metrics.parquet", "fv_context_metrics.parquet")
+        if fv_path != path and os.path.exists(fv_path):
+            try:
+                fv_cols = ["fv_context_cdr_lddt", "H3_fv_context_lddt"]
+                fdf = pd.read_parquet(fv_path, columns=["target_id", "seed", "sample"] + fv_cols)
+                for row in fdf.itertuples(index=False):
+                    d = row._asdict()
+                    try:
+                        key = (str(d["target_id"]), _norm_seed(d.get("seed")), int(d["sample"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if key in table:
+                        for col in fv_cols:
+                            try:
+                                table[key][col] = float(d[col])
+                            except (TypeError, ValueError):
+                                table[key][col] = float("nan")
+            except Exception:
+                logger.exception("PrecomputedMetricStore: failed to read fv_context parquet %s", fv_path)
+
         self._tables[source_name] = table
         _TABLE_CACHE[path] = table
         logger.debug(
@@ -284,4 +315,5 @@ class PrecomputedMetricStore:
         values = table.get(key)
         if values is None:
             return float("nan")
+        column = self.column_alias.get(source_name, {}).get(column, column)
         return float(values.get(column, float("nan")))

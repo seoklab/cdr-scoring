@@ -244,6 +244,14 @@ class Sujin_with_SE3(nn.Module):
             num_layers=self.num_layers,
             **kwargs
         )
+        # A/B 2026-10-23 (arm B): independent scalar regression head on the SAME pooled
+        # feature as linear_out_1, predicting the whole Fv-context CDR-lDDT. Created
+        # after the backbone and inside fork_rng, so it neither shifts the backbone's
+        # seeded initialisation nor consumes global RNG (arm A, without the head, then
+        # sees the identical random stream).
+        if kwargs.get('aux_fv_reg', False):
+            with torch.random.fork_rng(devices=[]):
+                self.aux_reg_head = nn.Linear(fiber_out[0], 1, bias=True)
 
     def forward(self, batched_graph,basis=None):
         '''
@@ -307,6 +315,17 @@ class Sujin_with_SE3(nn.Module):
             out_dic['embed'] = out
             out_dic['interface'] = self.interface_head(out).squeeze(-1)
             out_dic['final'] = self.final_head(out).squeeze(-1)
+            if hasattr(self, 'aux_reg_head'):
+                # FP32 regardless of AMP: eps can be 0.002, below FP16 resolution near 1.
+                # The node features are cast (differentiably) and mean-pooled in FP32, so
+                # the gradient still reaches the backbone; weights are read as float so
+                # the .half() DPO reference copy also runs.
+                with torch.autocast(device_type='cuda', enabled=False):
+                    h32 = feats['0'].squeeze(-1).float()
+                    pooled32 = dgl.ops.segment_reduce(batched_graph.batch_num_nodes(), h32, 'mean')
+                    out_dic['aux_pooled'] = pooled32
+                    out_dic['aux_reg'] = torch.nn.functional.linear(pooled32, self.aux_reg_head.weight.float(),
+                                                  self.aux_reg_head.bias.float()).squeeze(-1)
             if self.use_nodewise_score:
                 node = batched_graph.ndata['out_l0']
                 score = self.linear_out_1(node).squeeze(-1)

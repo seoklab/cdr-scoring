@@ -159,6 +159,9 @@ class PrecomputedMetricsSpec:
     require: bool = True
     metrics_filename: str = "metrics/loop_metrics.parquet"
     sources: Dict[str, str] = field(default_factory=dict)
+    # optional {source_name: {requested column: column read}}, e.g.
+    # {GP: {fv_context_cdr_lddt: cdr_lddt}} (GP has no Fv-context parquet)
+    column_alias: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -236,6 +239,44 @@ class DatasetSpec:
     # loaded, and so the training pool matches the fnat>0.5-gated validation
     # manifests. Strict >, matching the project-wide "fnat>0.5" filter.
     fnat_gate: Optional[float] = None
+    # Configurable per-target sampler bins on the training label (replaces the
+    # fixed A/B/C/D tiers when set). Each bin: {name, lo, quota}; a decoy goes to
+    # the first bin (sorted by lo, descending) with label >= lo. quota is an int
+    # (drawn up to what is available) or "rest" (no quota; filled in step 3).
+    # sampler_fill_order: bins that receive the remaining slots, in order; bins
+    # not listed (e.g. a quota-0 dead band) are never sampled. In bin mode the
+    # crystal is identified by SOURCE (Xtal), not by label >= 0.99, and counts
+    # toward sampler_xtal_bin's quota.
+    sampler_bins: Optional[List[Dict[str, Any]]] = None
+    sampler_fill_order: Optional[List[str]] = None
+    sampler_xtal_bin: Optional[str] = None
+    # Share of GP targets among all targets of a training epoch (float or
+    # ScheduleSpec). When set, num_gp = round(num_abag * p / (1 - p)).
+    gp_share: Any = None
+    # Pair-loss batch composition (sampler_mode: source_blocks, fvctx_pair runs).
+    # pair_groups {group: [source, ...]}: pairs are formed only inside a group.
+    # A group is eligible for a target when it holds >= pair_min_pairs pairs with
+    # |label diff| >= pair_min_delta. Two eligible groups -> two blocks of
+    # block_size decoys (groups drawn by pair_group_probs without replacement);
+    # one -> a single block of n_decoy. Inside a block up to block_top_quota
+    # (x2 for a single block) decoys come from label >= block_top_cut and the rest
+    # from below, spread over each range; Boltz2_pdiff decoys of one input /
+    # strength / round (same seed) are not repeated inside a stratum.
+    sampler_mode: Optional[str] = None
+    pair_groups: Optional[Dict[str, List[str]]] = None
+    pair_group_probs: Optional[Dict[str, float]] = None
+    block_size: int = 32
+    block_top_cut: float = 0.90
+    block_top_quota: int = 16
+    pair_min_delta: float = 0.02
+    pair_min_pairs: int = 20
+    pair_top_share: float = 0.5
+    # sampler_mode: parts (fvctx DPO runs). sampler_parts is an ordered list of
+    # {sources: [...], k: int | "all" | "rest", cap: int}: integer / "all" parts
+    # are drawn first (k decoys, or every decoy up to cap), then "rest" parts fill
+    # the remaining n_decoy slots in order; every draw is spread over the part's
+    # label range (no repeated Boltz2_pdiff seed while others remain).
+    sampler_parts: Optional[List[Dict[str, Any]]] = None
 
     # ── convenience helpers ──
     def effective_xtal_prob(self, epoch: int) -> float:
@@ -336,6 +377,8 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
             require=bool(pm_raw.get("require", True)),
             metrics_filename=pm_raw.get("metrics_filename", "metrics/loop_metrics.parquet"),
             sources={str(k): str(v) for k, v in (pm_raw.get("sources", {}) or {}).items()},
+            column_alias={str(k): {str(a): str(b) for a, b in (v or {}).items()}
+                          for k, v in (pm_raw.get("column_alias", {}) or {}).items()},
         )
 
     # "all" (string) or null → None → use entire list without subsampling
@@ -381,6 +424,20 @@ def load_dataset_spec(yaml_path: str | Path) -> DatasetSpec:
         precomputed_metrics=precomputed_metrics,
         dockq_gate=(None if raw.get("dockq_gate", None) is None else float(raw.get("dockq_gate"))),
         fnat_gate=(None if raw.get("fnat_gate", None) is None else float(raw.get("fnat_gate"))),
+        sampler_bins=raw.get("sampler_bins", None),
+        sampler_fill_order=raw.get("sampler_fill_order", None),
+        sampler_xtal_bin=raw.get("sampler_xtal_bin", None),
+        gp_share=_maybe_schedule(raw.get("gp_share", None)),
+        sampler_mode=raw.get("sampler_mode", None),
+        pair_groups=raw.get("pair_groups", None),
+        pair_group_probs=raw.get("pair_group_probs", None),
+        block_size=int(raw.get("block_size", 32)),
+        block_top_cut=float(raw.get("block_top_cut", 0.90)),
+        block_top_quota=int(raw.get("block_top_quota", 16)),
+        pair_min_delta=float(raw.get("pair_min_delta", 0.02)),
+        pair_min_pairs=int(raw.get("pair_min_pairs", 20)),
+        pair_top_share=float(raw.get("pair_top_share", 0.5)),
+        sampler_parts=raw.get("sampler_parts", None),
     )
     # ── CLI overrides via environment (set by train.py from argparser) ──
     # This keeps a single source of truth: both train.py's spec and the
