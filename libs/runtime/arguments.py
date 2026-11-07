@@ -251,6 +251,10 @@ PARSER.add_argument('--atom_res_cutoff', type=float, default=8.0,
                     help='Only residue pairs with CA-CA below this are expanded into atom pairs.')
 PARSER.add_argument('--atom_max_neighbors', type=int, default=24,
                     help='Per-atom neighbour cap, nearest first.')
+PARSER.add_argument('--atom_grad_checkpoint', action='store_true', default=False,
+                    help='Recompute atom attention blocks in backward instead of storing '
+                         'their activations. Same parameters, same math, same state dict -- '
+                         'only slower. Unlike --low_memory it does not relayout the SE3 convs.')
 PARSER.add_argument('--atom_lr_mult', type=float, default=10.0,
                     help='Learning-rate multiplier for the freshly initialised atom encoder '
                          '(the trunk is being fine-tuned, the encoder is training from scratch).')

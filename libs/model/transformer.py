@@ -271,6 +271,7 @@ class Sujin_with_SE3(nn.Module):
                     atom_radius=float(kwargs.get('atom_radius', 5.0)),
                     res_cutoff=float(kwargs.get('atom_res_cutoff', 8.0)),
                     max_neighbors=int(kwargs.get('atom_max_neighbors', 24)),
+                    grad_checkpoint=bool(kwargs.get('atom_grad_checkpoint', False)),
                 )
                 self.atom_to_res = nn.Linear(fiber_in[0], fiber_in[0], bias=False)
                 nn.init.zeros_(self.atom_to_res.weight)

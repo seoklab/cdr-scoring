@@ -25,6 +25,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 from data_loading.constants import (ATOM14_TYPE_IDX, ATOM14_BACKBONE_SLOTS, ALL_NUM_ATOM,
                                     AA3_IDX, MAX_NUM_ATOM)
@@ -129,9 +130,18 @@ class AtomEncoder(nn.Module):
 
     def __init__(self, d_out: int, d_model: int = 32, n_layers: int = 2, n_heads: int = 4,
                  atom_radius: float = 5.0, res_cutoff: float = 8.0, n_rbf: int = 16,
-                 max_neighbors: int = 24, dropout: float = 0.1, chunk_pairs: int = 20000):
+                 max_neighbors: int = 24, dropout: float = 0.1, chunk_pairs: int = 20000,
+                 grad_checkpoint: bool = False):
         super().__init__()
         self.d_model = d_model
+        # Recompute each block's activations in backward instead of keeping them.
+        # A 64-graph batch reaches ~4M atom edges, and every block holds k, v,
+        # edge_k, edge_v and the per-edge message at (E, d_model) -- which is what
+        # ran a 32 GB V100 out of memory. This is a call-time wrapper, so it adds
+        # no parameters and the state dict is unchanged; --low_memory is NOT an
+        # alternative here, it switches the SE3 convs to an unfused layout and
+        # renames their parameters, so a checkpoint no longer loads.
+        self.grad_checkpoint = bool(grad_checkpoint)
         self.atom_radius = float(atom_radius)
         self.res_cutoff = float(res_cutoff)
         self.max_neighbors = int(max_neighbors)
@@ -277,7 +287,11 @@ class AtomEncoder(nn.Module):
 
         e_feat = e_feat.to(h.dtype)
         for block in self.blocks:
-            h = block(h, e_feat, src, dst)
+            if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+                h = torch.utils.checkpoint.checkpoint(
+                    block, h, e_feat, src, dst, use_reentrant=False)
+            else:
+                h = block(h, e_feat, src, dst)
         h = self.norm_out(h).reshape(n_res, MAX_NUM_ATOM, self.d_model)
 
         # ── pool each residue's own atoms ────────────────────────────────────
