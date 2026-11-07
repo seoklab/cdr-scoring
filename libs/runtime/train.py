@@ -3207,6 +3207,12 @@ def finetune(
     if getattr(args, 'ab_protocol', False):
         # A/B: the only key allowed to be absent is the new arm-B head; nothing unexpected
         _allowed = {'aux_reg_head.weight', 'aux_reg_head.bias'} if getattr(args, 'aux_fv_reg', False) else set()
+        if getattr(args, 'atom_encoder', False):
+            # Arm B's atom pathway cannot be in a backbone-only reference ckpt.
+            # atom_to_res is zero-initialised, so the reference still scores
+            # exactly as the backbone-only model it was trained as.
+            _allowed |= {k for k in _ref_missing
+                         if k.startswith(('atom_encoder.', 'atom_to_res.'))}
         _bad_m = sorted(set(_ref_missing) - _allowed)
         if local_rank == 0:
             print(f'[ab] checkpoint keys: missing={sorted(_ref_missing)} unexpected={sorted(_ref_unexpected)} '
@@ -3217,6 +3223,15 @@ def finetune(
         if dist.is_initialized() and world_size > 1:
             raise RuntimeError('[ab] --ab_protocol runs on one GPU (no DDP); start it with GPUS=1')
     pre_trained = copy.deepcopy(model)
+    if getattr(args, 'atom_encoder', False) and any(
+            k.startswith(('atom_encoder.', 'atom_to_res.')) for k in _ref_missing):
+        # The reference is frozen and its atom_to_res is still zero, so the atom
+        # pathway contributes exactly nothing to its scores. Skip it rather than
+        # pay for a block whose output is multiplied by zero.
+        pre_trained.use_atom_encoder = False
+        if local_rank == 0:
+            print('[ab] reference keeps the backbone-only pathway '
+                  '(atom_to_res is zero there)', flush=True)
     pre_trained.half()
     for param in pre_trained.parameters():
         param.requires_grad = False
@@ -3227,7 +3242,11 @@ def finetune(
     if not fresh_c1:
         pol_ck = torch.load(policy_init_path, map_location={'cuda:0': f'cuda:{local_rank}'})
         _pm, _pu = model.load_state_dict(pol_ck['state_dict'], strict=False)
-        if getattr(args, 'ab_protocol', False) and (_pu or set(_pm) - {'aux_reg_head.weight', 'aux_reg_head.bias'}):
+        _pol_allowed = {'aux_reg_head.weight', 'aux_reg_head.bias'}
+        if getattr(args, 'atom_encoder', False):
+            _pol_allowed |= {k for k in _pm
+                             if k.startswith(('atom_encoder.', 'atom_to_res.'))}
+        if getattr(args, 'ab_protocol', False) and (_pu or set(_pm) - _pol_allowed):
             raise RuntimeError(f'[ab] policy checkpoint key mismatch: missing={_pm}, unexpected={_pu}')
         if local_rank == 0:
             print(f'[finetune] policy init = {policy_init_path} (continue prior Phase-C)')
