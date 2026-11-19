@@ -253,6 +253,29 @@ class Sujin_with_SE3(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.aux_reg_head = nn.Linear(fiber_out[0], 1, bias=True)
 
+        # side-chain branch: atom-level encoder in front of the residue trunk.
+        # `atom_to_res` starts at exactly zero, so at step 0 this model's output is
+        # bit-identical to the same model without the encoder. Any later difference
+        # is therefore attributable to the atom pathway alone — which is what makes
+        # the paired A/B pilot interpretable. Built inside fork_rng so the arm
+        # WITHOUT it draws the identical random stream for the shared weights.
+        self.use_atom_encoder = bool(kwargs.get('atom_encoder', False))
+        if self.use_atom_encoder:
+            from model.atom_encoder import AtomEncoder
+            with torch.random.fork_rng(devices=[]):
+                self.atom_encoder = AtomEncoder(
+                    d_out=fiber_in[0],
+                    d_model=int(kwargs.get('atom_dim', 32)),
+                    n_layers=int(kwargs.get('atom_layers', 2)),
+                    n_heads=int(kwargs.get('atom_heads', 4)),
+                    atom_radius=float(kwargs.get('atom_radius', 5.0)),
+                    res_cutoff=float(kwargs.get('atom_res_cutoff', 8.0)),
+                    max_neighbors=int(kwargs.get('atom_max_neighbors', 24)),
+                    grad_checkpoint=bool(kwargs.get('atom_grad_checkpoint', False)),
+                )
+                self.atom_to_res = nn.Linear(fiber_in[0], fiber_in[0], bias=False)
+                nn.init.zeros_(self.atom_to_res.weight)
+
     def forward(self, batched_graph,basis=None):
         '''
         Input Embedding from Sujin
@@ -272,6 +295,9 @@ class Sujin_with_SE3(nn.Module):
             node = torch.cat([aa_feature,torch.sin(bb_torsion),torch.cos(bb_torsion)],dim=1)
             del aatype, aa_feature, bb_torsion
             node = self.embedding_node(node)
+            if self.use_atom_encoder:
+                # zero-initialised at step 0; see __init__
+                node = node + self.atom_to_res(self.atom_encoder(batched_graph))
             #edge embedding type-0: distance[25], bond_character[2], rel_index[1], pair_torsion[3+3]
             bond_character = batched_graph.edata['e_ij'][:,-2:].float()
             bond_character = self.bond_embed_layer(bond_character).float()

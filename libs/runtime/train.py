@@ -44,6 +44,10 @@ from runtime.pair_sampling import (
     PairSamplingConfig, build_training_pairs, build_decoy_tiers, detect_xtal_mask,
     build_af3_matched_pairs, AF3_LDDT_TIER_PAIR_P,
 )
+from runtime.listnet import (
+    listnet_loss, target_mean_scale, epoch_order, GroupScan, scan_collate,
+    summarize_scan, subset_groups, ListNetInputError, teacher_tau, spread, val_teacher_stats,
+)
 import numpy as np
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_descriptor')
@@ -115,6 +119,67 @@ def _in_groups(g, gids):
     for gi in gids:
         m |= (g == int(gi))
     return m
+
+
+# ── decoy scheduling 2026-11-07: which comparisons would change the current pick ──
+def _sched_critical_mask(scores, y, g, pos, neg, topk=1, min_delta=0.0):
+    """Bool mask over the pairs: would fixing this pair move its group's top1?
+
+    ``pos``/``neg`` index the higher- and lower-label candidate of each pair (both in the
+    same pair group ``g``). A pair is selection-critical when its LOWER-label candidate is
+    among the top-``topk`` candidates by the CURRENT model score of its group, and the
+    higher-label one is at least ``min_delta`` better. Every other pair re-orders
+    candidates that would not have been picked anyway.
+
+    ``scores`` must be detached; one target per batch, so a group is this target's
+    candidates from one source group.
+    """
+    crit = torch.zeros(pos.numel(), dtype=torch.bool, device=pos.device)
+    if pos.numel() == 0:
+        return crit
+    for gi in torch.unique(g[pos]):
+        idx = torch.nonzero(g == gi, as_tuple=False).reshape(-1)
+        k = min(int(topk), int(idx.numel()))
+        if k <= 0:
+            continue
+        is_top = torch.zeros_like(g, dtype=torch.bool)
+        is_top[idx[torch.topk(scores[idx], k).indices]] = True
+        crit |= is_top[neg] & ((y[pos] - y[neg]) >= float(min_delta))
+    return crit
+
+
+def _sched_pair_loss(fn, crit, share):
+    """share * mean(loss over critical pairs) + (1 - share) * mean(loss over the rest).
+
+    ``fn(mask)`` returns the pair loss over the selected pairs (mask None = all of them).
+    Falls back to the plain loss when one side is empty, so a group whose pick is already
+    its best candidate is trained exactly as before. Returns (loss, n_critical).
+    """
+    if crit is None:
+        return fn(None), 0
+    n = int(crit.sum())
+    if n == 0 or n == crit.numel():
+        return fn(None), n
+    return float(share) * fn(crit) + (1.0 - float(share)) * fn(~crit), n
+
+
+def _sched_group_stats(scores, y, g, gids):
+    """In-batch headroom readout for the groups in ``gids``: how far the current pick is
+    from the best candidate, and where the best candidate sits in the current ranking."""
+    gap, rank, hit, n = 0.0, 0.0, 0.0, 0
+    for gi in gids:
+        idx = torch.nonzero((g == int(gi)) & torch.isfinite(y), as_tuple=False).reshape(-1)
+        if idx.numel() < 2:
+            continue
+        i_pick = idx[int(torch.argmax(scores[idx]))]
+        i_best = idx[int(torch.argmax(y[idx]))]
+        gap += float(y[i_best] - y[i_pick])
+        rank += float((scores[idx] > scores[i_best]).sum()) + 1.0
+        hit += float(i_pick == i_best)
+        n += 1
+    if n == 0:
+        return None
+    return {'gap': gap / n, 'rank_of_best': rank / n, 'pick_is_best': hit / n, 'n_groups': float(n)}
 
 
 def _vanilla_decoy_mask(args, eval_metrics, labels, device):
@@ -654,6 +719,37 @@ def load_state(model: nn.Module, optimizer: Optimizer, path: pathlib.Path, callb
 _NO_DECAY_HEADS = ('linear_out_1', 'final_head', 'interface_head', 'ord_head', 'aux_reg_head')
 
 
+def _atom_lr_split(groups, model, args, local_rank, tag):
+    """Give the atom encoder its own (higher) learning rate.
+
+    Arm B fine-tunes a converged trunk while the atom encoder starts from scratch,
+    so one shared lr is wrong for both: too high wrecks the trunk, too low leaves
+    the encoder at its initialisation. Splits every group in two and scales the
+    atom half by ``--atom_lr_mult``. A no-op when the encoder is off or mult == 1.
+    """
+    mult = float(getattr(args, 'atom_lr_mult', 1.0))
+    if not getattr(args, 'atom_encoder', False) or mult == 1.0:
+        return groups
+    atom_ids = {id(p) for n, p in model.named_parameters()
+                if n.startswith(('atom_encoder.', 'atom_to_res.'))
+                or '.atom_encoder.' in n or '.atom_to_res.' in n}
+    if not atom_ids:
+        return groups
+    out, n_atom = [], 0
+    for g in groups:
+        base = [p for p in g['params'] if id(p) not in atom_ids]
+        atom = [p for p in g['params'] if id(p) in atom_ids]
+        if base:
+            out.append({**g, 'params': base})
+        if atom:
+            n_atom += len(atom)
+            out.append({**g, 'params': atom, 'lr': float(args.learning_rate) * mult})
+    if local_rank == 0:
+        print(f'[{tag}] atom encoder lr split: {n_atom} tensors at '
+              f'{float(args.learning_rate) * mult:g} (x{mult:g}), rest at {args.learning_rate:g}')
+    return out
+
+
 def _param_groups(model, args, local_rank, tag):
     """AdamW parameter groups: keep weight decay off the output heads and 1-D params.
 
@@ -673,7 +769,7 @@ def _param_groups(model, args, local_rank, tag):
     part that can actually overfit is unchanged.
     """
     if not getattr(args, 'no_decay_heads', False):
-        return model.parameters()
+        return _atom_lr_split([{'params': list(model.parameters())}], model, args, local_rank, tag)
     decay, no_decay, nd_names = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -687,8 +783,9 @@ def _param_groups(model, args, local_rank, tag):
               f'{args.weight_decay}, {len(no_decay)} excluded (heads + 1-D params)')
         print(f'[{tag}] excluded heads: '
               f'{[n for n in nd_names if any(h in n for h in _NO_DECAY_HEADS)]}')
-    return [{'params': decay, 'weight_decay': float(args.weight_decay)},
-            {'params': no_decay, 'weight_decay': 0.0}]
+    return _atom_lr_split([{'params': decay, 'weight_decay': float(args.weight_decay)},
+                           {'params': no_decay, 'weight_decay': 0.0}],
+                          model, args, local_rank, tag)
 
 
 def _resolve_gen_source_ids(args, spec, local_rank, tag):
@@ -1464,16 +1561,15 @@ def train(model: nn.Module,
                     "learning_rate": current_lr,
                     "epoch": epoch_idx,
                 }
-                # The legacy top{k}_rmsd keys actually hold the label metric
-                # (cdr_lddt when label_metric=loop_lddt), so log them under clear
-                # cdr_lddt names, and add the H3 / DockQ / CAPRI validation
+                # top{k}_metric holds the active label metric, so log it under a
+                # name that says which metric that is, and add the H3 / DockQ / CAPRI validation
                 # metrics computed by _add_eval_top1_metrics. Guarded by presence
                 # so missing keys (e.g. no holo targets) are simply skipped.
                 _valid_log_aliases = {
-                    "top1_rmsd":  "valid/top1_cdr_lddt",
-                    "top3_rmsd":  "valid/top3_cdr_lddt",
-                    "top5_rmsd":  "valid/top5_cdr_lddt",
-                    "top10_rmsd": "valid/top10_cdr_lddt",
+                    "top1_metric":  "valid/top1_cdr_lddt",
+                    "top3_metric":  "valid/top3_cdr_lddt",
+                    "top5_metric":  "valid/top5_cdr_lddt",
+                    "top10_metric": "valid/top10_cdr_lddt",
                     "eval_oracle_loop_lddt": "valid/oracle_cdr_lddt",
                     "eval_loop_lddt_regret": "valid/cdr_lddt_regret",
                     "eval_top1_h3_lddt":     "valid/top1_h3_lddt",
@@ -1838,17 +1934,22 @@ def _manifest_validate(net, manifest_path, pool, dataset_config, args, device, e
                     _sid_v = em.get('source_id')
                     _sid_v = (_sid_v.float().reshape(-1) if _sid_v is not None else None)
                     _new = not os.path.exists(_fp)
+                    _cs, _cm = em.get('cand_seed'), em.get('cand_sample')
+                    _ids_on = _cs is not None and _cm is not None
                     with open(_fp, 'a') as _fh:
                         if _new:
                             _fh.write('epoch,pool,target,idx,decoy,source_id,cdr_lddt,'
-                                      'fnat,score_intrinsic,score_final,score_interface\n')
+                                      'fnat,score_intrinsic,score_final,score_interface'
+                                      + (',seed,sample,selected' if _ids_on else '') + '\n')
                         for _j in range(n):
                             _f_v = float(fnat[_j]) if fnat is not None and _j < fnat.numel() else float('nan')
                             _s_v = float(_sid_v[_j]) if _sid_v is not None and _j < _sid_v.numel() else float('nan')
+                            _id_s = (f',{int(_cs[_j])},{int(_cm[_j])},{int(_j == i_top)}'
+                                     if _ids_on else '')
                             _fh.write(f'{int(epoch_idx)},{pool},{_tgt},{idx},{_j},{_s_v:.0f},'
                                       f'{float(cdr[_j]):.6f},{_f_v:.6f},'
                                       f'{float(s_i[_j]):.6f},{float(s_f[_j]):.6f},'
-                                      f'{float(s_x[_j]):.6f}\n')
+                                      f'{float(s_x[_j]):.6f}{_id_s}\n')
                 except Exception as _e:
                     logging.warning('[score_scatter] %s: %s', pool, _e)
 
@@ -2175,6 +2276,10 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
     _typed = bool(getattr(args, 'dpo_typed_pairs', False))
     _type_w = [float(x) for x in str(getattr(args, 'dpo_type_weights', '0.45,0.45,0.10')).split(',')]
     _near_cut = getattr(args, 'near_native_cutoff', None)
+    # decoy scheduling: on only while training, after the warm-up, and only on the typed-pair path
+    _sched_share = float(getattr(args, 'pair_sched_share', 0.0))
+    _sched_on = (bool(getattr(args, 'pair_sched', False)) and _typed and is_train and probe is None
+                 and epoch_idx > int(getattr(args, 'pair_sched_warmup_epochs', 0)))
 
     for i, batch in tqdm(enumerate(dataloader), total=len(dataloader), unit='batch',
                          desc=f'{train_tag} Epoch {epoch_idx}', disable=(local_rank != 0)):
@@ -2202,6 +2307,7 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
         try:
             _typed_pairs = None
             _typed_extra = None
+            _sched_crit = None
             for callback in callbacks:
                 callback.on_batch_start()
 
@@ -2363,6 +2469,18 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
                             _keep = torch.randperm(_pos.numel(), generator=_gen)[:_cap].to(device)
                             _pos, _neg, _types = _pos[_keep], _neg[_keep], _types[_keep]
                         _typed_pairs = (_pos, _neg, _types)
+                        if _sched_on:
+                            _sched_crit = _sched_critical_mask(
+                                pi_out.detach().reshape(-1), _y, _g, _pos, _neg,
+                                topk=int(getattr(args, 'pair_sched_topk', 1)),
+                                min_delta=float(getattr(args, 'pair_sched_min_delta', 0.0)))
+                            _gids_all = [int(x) for x in torch.unique(_g[_g >= 0]).tolist()]
+                            _vg_ids = list(getattr(args, '_vanilla_gids', None) or []) or _gids_all
+                            for _nm, _ids in (('van', _vg_ids), ('all', _gids_all)):
+                                _st = _sched_group_stats(pi_out.detach().reshape(-1), _y, _g, _ids)
+                                if _st is not None:
+                                    for _k, _v in _st.items():
+                                        out[f'sched_{_nm}_{_k}'] = float(_v)
                         if getattr(args, '_vanilla_gids', None):
                             _typed_extra = (_in_groups(_g[_pos], args._vanilla_gids), _y[_pos] - _y[_neg])
                         pairs = []
@@ -2422,12 +2540,38 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
                         _isv, _pd = _typed_extra
                         _w = float(args.vanilla_share)
                         _P, _N, _T = _typed_pairs
+                        # decoy scheduling splits each side into the pairs that would move its
+                        # group's top1 and the rest; the vanilla / rest balance is untouched.
+                        _Pv, _Nv, _Tv = _P[_isv], _N[_isv], _T[_isv]
+                        _Pr, _Nr, _Tr = _P[~_isv], _N[~_isv], _T[~_isv]
+                        _Cv = _sched_crit[_isv] if _sched_crit is not None else None
+                        _Cr = _sched_crit[~_isv] if _sched_crit is not None else None
                         if bool(getattr(args, 'vanilla_dpo_uniform', False)):
-                            _lv = tier_dpo.dpo_pair_mean_loss(pi_out, ref_out, _P[_isv], _N[_isv], device)
+                            def _vfn(m, _p=_Pv, _n=_Nv):
+                                if m is not None:
+                                    _p, _n = _p[m], _n[m]
+                                return tier_dpo.dpo_pair_mean_loss(pi_out, ref_out, _p, _n, device)
                         else:
-                            _lv, _ = tier_dpo.dpo_typed_loss(pi_out, ref_out, _P[_isv], _N[_isv], _T[_isv], _type_w, device)
-                        _lr, _ = tier_dpo.dpo_typed_loss(pi_out, ref_out, _P[~_isv], _N[~_isv], _T[~_isv], _type_w, device)
+                            def _vfn(m, _p=_Pv, _n=_Nv, _t=_Tv):
+                                if m is not None:
+                                    _p, _n, _t = _p[m], _n[m], _t[m]
+                                return tier_dpo.dpo_typed_loss(pi_out, ref_out, _p, _n, _t, _type_w, device)[0]
+
+                        def _rfn(m, _p=_Pr, _n=_Nr, _t=_Tr):
+                            if m is not None:
+                                _p, _n, _t = _p[m], _n[m], _t[m]
+                            return tier_dpo.dpo_typed_loss(pi_out, ref_out, _p, _n, _t, _type_w, device)[0]
+                        _lv, _ncv = _sched_pair_loss(_vfn, _Cv, _sched_share)
+                        _lr, _ncr = _sched_pair_loss(_rfn, _Cr, _sched_share)
                         within_loss = _w * _lv + (1.0 - _w) * _lr
+                        if _sched_crit is not None:
+                            out['sched_n_crit_vanilla'] = float(_ncv)
+                            out['sched_n_crit_rest'] = float(_ncr)
+                            out['sched_n_crit'] = float(int(_sched_crit.sum()))
+                            out['sched_frac_crit'] = float(_sched_crit.float().mean()) if _sched_crit.numel() else 0.0
+                            with torch.no_grad():
+                                _mgc = (pi_out[_P[_sched_crit]] - pi_out[_N[_sched_crit]]) > 0
+                                out['sched_acc_crit'] = float(_mgc.float().mean()) if _mgc.numel() else 0.0
                         _n_by = {t: int((_T == t).sum()) for t in range(3)}
                         with torch.no_grad():
                             _mgv = (pi_out[_P] - pi_out[_N]) > 0
@@ -2442,8 +2586,17 @@ def run_epoch_dpo(model, pre_trained, loss_fn, dataloader, epoch_idx,
                                 out[f'dpo_n_vanilla_{_nm}'] = float(_sel.sum())
                                 out[f'dpo_acc_vanilla_{_nm}'] = float(_mgv[_sel].float().mean()) if bool(_sel.any()) else 0.0
                     else:
-                        within_loss, _n_by = tier_dpo.dpo_typed_loss(
-                            pi_out, ref_out, _typed_pairs[0], _typed_pairs[1], _typed_pairs[2], _type_w, device)
+                        _P0, _N0, _T0 = _typed_pairs
+
+                        def _afn(m, _p=_P0, _n=_N0, _t=_T0):
+                            if m is not None:
+                                _p, _n, _t = _p[m], _n[m], _t[m]
+                            return tier_dpo.dpo_typed_loss(pi_out, ref_out, _p, _n, _t, _type_w, device)[0]
+                        within_loss, _nc0 = _sched_pair_loss(_afn, _sched_crit, _sched_share)
+                        _n_by = {t: int((_T0 == t).sum()) for t in range(3)}
+                        if _sched_crit is not None:
+                            out['sched_n_crit'] = float(_nc0)
+                            out['sched_frac_crit'] = float(_sched_crit.float().mean()) if _sched_crit.numel() else 0.0
                     n_within = int(_typed_pairs[0].numel())
                     out['dpo_n_near_near'] = float(_n_by[0])
                     out['dpo_n_near_non'] = float(_n_by[1])
@@ -2976,7 +3129,7 @@ def _ab_epoch_end(model, optimizer, callbacks, epoch_idx, mv, ep_train, st, args
     pa = float(mv.get(f'val/{pool}/gen_pair_acc', nan))
     rec = {'epoch': epoch_idx, **{k: float(v) for k, v in mv.items() if isinstance(v, (int, float)) and k != 'epoch'}}
     for k, v in (ep_train or {}).items():
-        if k.startswith(('ab_', 'aux_', 'dpo_n_pairs_')) or k in ('dpo_n_cross_vanilla_excluded', 'final_loss'):
+        if k.startswith(('ab_', 'aux_', 'sched_', 'dpo_n_pairs_')) or k in ('dpo_n_cross_vanilla_excluded', 'final_loss'):
             try:
                 rec[f'train/{k}'] = float(v)
             except Exception:
@@ -3029,6 +3182,621 @@ def _ab_epoch_end(model, optimizer, callbacks, epoch_idx, mv, ep_train, st, args
     return False
 
 
+def _listnet_sum_over_ranks(values, device):
+    t = torch.tensor(values, dtype=torch.float64, device=device)
+    if dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return [float(v) for v in t.tolist()]
+
+
+def _listnet_floats(metrics):
+    return {k: float(v) for k, v in (metrics or {}).items()
+            if k != 'epoch' and isinstance(v, (int, float, np.integer, np.floating))}
+
+
+def _listnet_manifest_info(path):
+    import json as _json
+    with open(path) as fh:
+        man = _json.load(fh)
+    counts = {str(t): len(c) for t, c in man['targets'].items()}
+    info = {'path': str(path), 'hash': man.get('hash'), 'pool': man.get('pool'),
+            'gate': man.get('gate'), 'gate_metric': man.get('gate_metric'),
+            'sources': man.get('sources'), 'n_targets': len(counts), 'n_decoys': sum(counts.values())}
+    return info, counts
+
+
+def _listnet_scan_groups(train_pool, dataset_config, args, local_rank):
+    import json as _json
+    from torch.utils.data import DataLoader
+    from data_loading.data_module import MyDataset
+    ds = MyDataset(list(train_pool), is_train=True, dataset_config=dataset_config)
+    ds._listnet_scan = True
+    ds.set_epoch(1)
+    loader = DataLoader(GroupScan(ds), batch_size=None, shuffle=False,
+                        num_workers=int(args.num_workers), collate_fn=scan_collate)
+    rows = list(tqdm(loader, total=len(ds), unit='target', desc='listnet group scan',
+                     disable=(local_rank != 0)))
+    summary, kept, excluded, per_target = summarize_scan(rows, int(args.listnet_max_candidates))
+    subset = str(getattr(args, 'listnet_train_subset', 'all') or 'all')
+    kept = subset_groups(kept, per_target, subset)
+    summary['train_subset'] = subset
+    summary['n_targets_in_subset'] = len(kept)
+    smoke = int(getattr(args, 'listnet_smoke_targets', 0) or 0)
+    if smoke > 0:
+        kept = kept[:smoke]
+    summary['smoke_targets'] = smoke
+    summary['n_targets_used'] = len(kept)
+    summary['n_targets_used_holo'] = sum(1 for t in kept if per_target[t]['holo'])
+    summary['n_targets_used_apo'] = len(kept) - summary['n_targets_used_holo']
+    if not kept:
+        raise RuntimeError(f'[listnet] no train target with >= 2 valid candidates '
+                           f'(train subset {subset!r}): {summary}')
+    if local_rank == 0:
+        os.makedirs(str(args.log_dir), exist_ok=True)
+        with open(os.path.join(str(args.log_dir), 'listnet_groups.json'), 'w') as fh:
+            _json.dump({'summary': summary, 'excluded': excluded, 'per_target': per_target}, fh, indent=1)
+        print(f'[listnet] train groups: {summary}', flush=True)
+        if excluded:
+            print(f'[listnet] excluded {len(excluded)} target(s) with < 2 valid candidates: '
+                  f'{sorted(excluded)[:20]}', flush=True)
+        if summary['n_candidates_dropped_nonfinite_label'] > 0:
+            print(f"[listnet] WARNING {summary['n_candidates_dropped_nonfinite_label']} candidate(s) "
+                  f'have a non-finite label and are left out (see listnet_groups.json)', flush=True)
+    return kept, summary, per_target
+
+
+def _listnet_teacher_cfg(args):
+    return {'mode': str(getattr(args, 'listnet_teacher', 'fixed') or 'fixed'),
+            'tau_q': float(args.listnet_tau_q), 'floor': float(getattr(args, 'listnet_tau_q_floor', 0.005)),
+            'tau_s': float(args.listnet_tau_s)}
+
+
+def _listnet_check_group(batch, pdb, n, allowed_ids):
+    em = _extract_eval_metrics(batch)
+    cols = [_metric_tensor(em, k, 'cpu') for k in ('source_id', 'cand_seed', 'cand_sample')]
+    if any(c is None or c.numel() != n for c in cols):
+        raise RuntimeError(f'[listnet] {pdb}: candidate ids (source_id/cand_seed/cand_sample) '
+                           f'missing or not aligned with the {n} scores')
+    ids = list(zip(*(c.round().long().tolist() for c in cols)))
+    if len(set(ids)) != n:
+        raise RuntimeError(f'[listnet] {pdb}: {n - len(set(ids))} repeated candidate(s) in one group')
+    foreign = sorted({i[0] for i in ids} - set(allowed_ids))
+    if foreign:
+        raise RuntimeError(f'[listnet] {pdb}: candidates from source ids {foreign}, '
+                           f'outside the enabled set {sorted(allowed_ids)}')
+
+
+def run_epoch_listnet(model, dataloader, epoch_idx, grad_scaler, optimizer, local_rank, callbacks, args):
+    device = torch.cuda.current_device()
+    world = dist.get_world_size() if dist.is_initialized() else 1
+    cap = int(args.listnet_max_candidates)
+    accum = max(1, int(getattr(args, 'accumulate_grad_batches', 1) or 1))
+    allowed = set(getattr(args, '_listnet_source_ids', None) or [])
+    keys = ('loss', 'entropy', 'targets', 'cand', 'sel_q', 'best_q', 'lt2', 'oversized', 'holo')
+    tot = dict.fromkeys(keys, 0.0)
+    subset = str(getattr(args, 'listnet_train_subset', 'all') or 'all')
+    tau_map = getattr(args, '_listnet_tau_by_target', None)
+    taus = []
+    lr = float(optimizer.param_groups[0]['lr'])
+    n_batches, n_steps, window = len(dataloader), 0, 0
+    torch.cuda.reset_peak_memory_stats(device)
+    optimizer.zero_grad(set_to_none=True)
+    for i, batch in tqdm(enumerate(dataloader), total=n_batches, unit='batch',
+                         desc=f'listnet epoch {epoch_idx}', disable=(local_rank != 0)):
+        batched_graph, rmsd_s = to_cuda(batch[0:2])
+        pdb = str(batch[2])
+        if _should_skip_oversized_batch(batched_graph, pdb, epoch_idx, i, 'listnet', args, local_rank):
+            tot['oversized'] += 1
+        else:
+            for callback in callbacks:
+                callback.on_batch_start()
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                pred = model(batched_graph)
+            s = pred['out'].reshape(-1)
+            q = rmsd_s.reshape(-1)
+            if s.numel() != q.numel() or s.numel() > cap:
+                raise RuntimeError(f'[listnet] {pdb}: {s.numel()} scores vs {q.numel()} labels '
+                                   f'(max candidates per group = {cap})')
+            _listnet_check_group(batch, pdb, int(s.numel()), allowed)
+            fnat = _metric_tensor(_extract_eval_metrics(batch), 'fnat', 'cpu')
+            holo = bool(fnat is not None and bool(torch.isfinite(fnat).any()))
+            if subset != 'all' and holo != (subset == 'holo'):
+                raise RuntimeError(f'[listnet] {pdb}: {"holo" if holo else "apo"} group in a '
+                                   f'--listnet_train_subset {subset} run')
+            if tau_map is not None and pdb not in tau_map:
+                raise RuntimeError(f'[listnet] {pdb}: no cached adaptive tau_q for this group')
+            tq = float(tau_map[pdb]) if tau_map is not None else float(args.listnet_tau_q)
+            out = listnet_loss(s, q, tau_q=tq, tau_s=float(args.listnet_tau_s),
+                               names=[pdb], label_range=(0.0, 1.0))
+            if out['n_targets'] == 0:
+                loss = s.sum() * 0.0
+                tot['lt2'] += 1
+            else:
+                loss = out['loss_sum']
+                if not bool(torch.isfinite(loss)):
+                    raise ListNetInputError(
+                        f'[listnet] non-finite loss for target {pdb} (epoch {epoch_idx}, batch {i})')
+                window += 1
+                qf = q.detach().float()
+                tot['loss'] += float(loss.detach())
+                tot['entropy'] += float(out['entropy'].sum())
+                tot['targets'] += 1
+                tot['holo'] += float(holo)
+                tot['cand'] += int(s.numel())
+                tot['sel_q'] += float(qf[int(torch.argmax(s.detach().float()))])
+                tot['best_q'] += float(qf.max())
+                taus.append(tq)
+            grad_scaler.scale(loss).backward()
+        if (i + 1) % accum == 0 or (i + 1) == n_batches:
+            n_glob = int(round(_listnet_sum_over_ranks([float(window)], device)[0]))
+            if n_glob > 0:
+                grad_scaler.unscale_(optimizer)
+                # DDP averages over ranks: rescale the summed target losses to the global per-target mean.
+                scale = target_mean_scale(n_glob, world)
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
+                if args.gradient_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+                n_steps += 1
+            optimizer.zero_grad(set_to_none=True)
+            window = 0
+    tot = dict(zip(keys, _listnet_sum_over_ranks([tot[k] for k in keys], device)))
+    n = tot['targets']
+    if n <= 0:
+        raise RuntimeError(f'[listnet] epoch {epoch_idx}: no target with >= 2 valid candidates was trained')
+    tau_spread = spread(taus)
+    return {
+        'listnet_loss': tot['loss'] / n,
+        'listnet_entropy': tot['entropy'] / n,
+        'listnet_kl': (tot['loss'] - tot['entropy']) / n,
+        'n_targets': n,
+        'n_targets_holo': tot['holo'],
+        'n_targets_apo': n - tot['holo'],
+        'n_targets_lt2': tot['lt2'],
+        'n_oversized_skipped': tot['oversized'],
+        'candidates_mean': tot['cand'] / n,
+        'selected_q': tot['sel_q'] / n,
+        'oracle_q': tot['best_q'] / n,
+        'gap': (tot['best_q'] - tot['sel_q']) / n,
+        'n_optimizer_steps': float(n_steps),
+        'lr': lr,
+        'gpu_mem_peak_gb': torch.cuda.max_memory_allocated(device) / 2 ** 30,
+        'tau_q_min': tau_spread['min'],
+        'tau_q_median': tau_spread['median'],
+        'tau_q_max': tau_spread['max'],
+    }
+
+
+def _listnet_check_predictions(pred_dir, pool, epoch_idx, mv, manifest_counts, ref_counts=None, teacher=None):
+    import csv, glob
+    nan = float('nan')
+    problems, rows = [], {}
+    files = sorted(glob.glob(os.path.join(pred_dir, f'{pool}_ep{int(epoch_idx):03d}_rank*.csv')))
+    if not files:
+        problems.append(f'no prediction file for pool {pool} in {pred_dir}')
+    for fp in files:
+        with open(fp) as fh:
+            for r in csv.DictReader(fh):
+                rows.setdefault(r['target'], []).append(r)
+    missing = sorted(set(manifest_counts) - set(rows))
+    if missing:
+        problems.append(f'{len(missing)} manifest target(s) not evaluated, e.g. {missing[:5]}')
+    counts, sel_q = {}, []
+    for tgt, rs in rows.items():
+        counts[tgt] = len(rs)
+        picked = [r for r in rs if r.get('selected') == '1']
+        if len(picked) != 1:
+            problems.append(f'{tgt}: {len(picked)} selected rows (expected 1)')
+            continue
+        sel_q.append(float(picked[0]['cdr_lddt']))
+        if tgt in manifest_counts and len(rs) != manifest_counts[tgt]:
+            problems.append(f'{tgt}: {len(rs)} candidates scored vs {manifest_counts[tgt]} in the manifest')
+        if ref_counts is not None and ref_counts.get(tgt) != len(rs):
+            problems.append(f'{tgt}: {len(rs)} candidates vs {ref_counts.get(tgt)} at the baseline')
+    mean_sel = (sum(sel_q) / len(sel_q)) if sel_q else nan
+    top1 = float(mv.get(f'val/{pool}/intrinsic_top1_cdr_lddt', nan))
+    if not (math.isfinite(top1) and math.isfinite(mean_sel)):
+        problems.append(f'mean selected q is not finite (metric {top1}, predictions {mean_sel})')
+    elif abs(top1 - mean_sel) > 2e-6:
+        problems.append(f'metric {top1:.6f} != mean selected q of the saved predictions {mean_sel:.6f}')
+    n_metric = mv.get(f'val/{pool}/n_targets')
+    if n_metric is not None and int(n_metric) != len(rows):
+        problems.append(f'metric counts {int(n_metric)} targets, predictions hold {len(rows)}')
+    tstats = None
+    if teacher is not None and rows:
+        tg = sorted(rows)
+        tstats = val_teacher_stats(
+            [[float(r['cdr_lddt']) for r in rows[t]] for t in tg],
+            [[float(r['score_intrinsic']) for r in rows[t]] for t in tg],
+            [any(math.isfinite(float(r['fnat'])) for r in rows[t]) for t in tg],
+            teacher['mode'], teacher['tau_q'], teacher['floor'], teacher['tau_s'], names=tg)
+    return {'ok': not problems, 'problems': problems[:20], 'n_problems': len(problems),
+            'n_targets': len(rows), 'n_candidates': sum(counts.values()),
+            'selected_q_mean': mean_sel, 'counts': counts, 'teacher': tstats}
+
+
+def _listnet_validate(model, args, dataset_config, device, epoch_idx, logger, manifest_counts,
+                      ref_counts, local_rank):
+    import glob
+    pred_dir = str(args.score_scatter_dir)
+    if local_rank == 0:
+        for fp in glob.glob(os.path.join(pred_dir, f'*_ep{int(epoch_idx):03d}_rank*.csv')):
+            os.replace(fp, f'{fp}.stale{int(time.time())}')
+    if dist.is_initialized():
+        dist.barrier()
+    mv = _run_manifest_pools(model, args, dataset_config, device, epoch_idx, logger)
+    if dist.is_initialized():
+        dist.barrier()
+    if not mv or local_rank != 0:
+        return mv, None
+    check = _listnet_check_predictions(pred_dir, str(args.best_pool), epoch_idx, mv, manifest_counts,
+                                       ref_counts, teacher=_listnet_teacher_cfg(args))
+    mv.update({f'val/{args.best_pool}/{k}': v for k, v in (check.get('teacher') or {}).items()})
+    return mv, check
+
+
+def _listnet_write_history(result_dir, settings, st):
+    import json as _json
+    tmp = str(result_dir / 'listnet_history.json.tmp')
+    with open(tmp, 'w') as fh:
+        _json.dump({'settings': settings, 'baseline': st.get('baseline'), 'best': st.get('best'),
+                    'history': st['history']}, fh, indent=1, default=str)
+    os.replace(tmp, str(result_dir / 'listnet_history.json'))
+
+
+def _listnet_teacher_metrics(metrics, pool):
+    keys = ('listnet_kl', 'listnet_ce', 'listnet_entropy', 'holo/listnet_kl', 'apo/listnet_kl',
+            'n_kl_targets', 'tau_q_min', 'tau_q_median', 'tau_q_max', 'n_tau_q_at_floor')
+    return {f'val/{pool}/{k}': float(metrics[f'val/{pool}/{k}']) for k in keys if f'val/{pool}/{k}' in metrics}
+
+
+def _listnet_teacher_line(tr, mv, pool):
+    nan = float('nan')
+
+    def _v(k):
+        return float(mv.get(f'val/{pool}/{k}', nan))
+    head = (f'train tau_q min/med/max={tr.get("tau_q_min", nan):.4g}/{tr.get("tau_q_median", nan):.4g}/'
+            f'{tr.get("tau_q_max", nan):.4g} | ') if tr else ''
+    return (head + f'val kl={_v("listnet_kl"):.5f} (holo {_v("holo/listnet_kl"):.5f}, apo '
+            f'{_v("apo/listnet_kl"):.5f}) val tau_q min/med/max={_v("tau_q_min"):.4g}/'
+            f'{_v("tau_q_median"):.4g}/{_v("tau_q_max"):.4g} (at floor {_v("n_tau_q_at_floor"):.0f})')
+
+
+def _listnet_epoch_end(model, optimizer, callbacks, epoch_idx, mv, check, ep_train, st, settings,
+                       args, result_dir, logger, local_rank):
+    stop = os.path.join(str(args.log_dir), 'STOP')
+    stop_now = os.path.exists(stop)
+    if local_rank != 0:
+        return stop_now
+    from utils import _epoch_log_path
+    net = model.module if hasattr(model, 'module') else model
+    pool = str(args.best_pool)
+    nan = float('nan')
+
+    def _g(k):
+        return float(mv.get(f'val/{pool}/{k}', nan))
+    top1 = _g('intrinsic_top1_cdr_lddt')
+    ok = bool(check and check['ok'])
+    rec = {'epoch': epoch_idx,
+           **{f'train/{k}': float(v) for k, v in (ep_train or {}).items()},
+           **_listnet_floats(mv),
+           'val_pool_ok': ok,
+           'val_pool_problems': check['problems'] if check else ['validation skipped this epoch']}
+    st['history'].append(rec)
+    base = float((st.get('baseline') or {}).get('top1', nan))
+    saved = []
+    b = st.get('best')
+    if ok and top1 == top1 and (b is None or top1 > b['top1']):
+        st['best'] = {'epoch': epoch_idx, 'top1': top1, 'gap': _g('intrinsic_cdr_lddt_gap'),
+                      'holo_top1': _g('holo/top1'), 'apo_top1': _g('apo/top1'),
+                      'top1_minus_baseline': top1 - base}
+        torch.save({'state_dict': net.state_dict(), 'epoch': epoch_idx, 'metrics': rec},
+                   str(result_dir / 'best_top1.pt'))
+        saved.append('best_top1')
+    if epoch_idx % max(1, int(getattr(args, 'ckpt_interval', 1) or 1)) == 0:
+        save_state(model, optimizer, epoch_idx, result_dir / f'{args.param_name}_{epoch_idx}.pt', callbacks)
+        saved.append(f'epoch_{epoch_idx}')
+    ck = {'state_dict': net.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
+          'epoch': epoch_idx, 'listnet_state': st, 'rng': _rng_state()}
+    for cb in callbacks:
+        cb.on_checkpoint_save(ck)
+    tmp = str(result_dir / 'last.pt.tmp')
+    torch.save(ck, tmp)
+    os.replace(tmp, str(result_dir / 'last.pt'))
+    _listnet_write_history(result_dir, settings, st)
+    bt = st.get('best') or {}
+    tr = ep_train or {}
+    if getattr(args, 'wandb', False):
+        logger.log_metrics({**{f'train/{k}': float(v) for k, v in tr.items()},
+                            **_listnet_teacher_metrics(rec, pool),
+                            'best/top1_epoch': bt.get('epoch', nan), 'best/top1': bt.get('top1', nan),
+                            'best/top1_minus_baseline': bt.get('top1_minus_baseline', nan),
+                            'val_pool_ok': float(ok), 'epoch': epoch_idx})
+    log_path = _epoch_log_path(str(args.param_name), 'listnet')
+    cols = ('epoch', 'lr', 'loss', 'kl', 'n_train', 'train_sel_q', 'val_top1', 'minus_base',
+            'val_gap', 'holo_top1', 'apo_top1', 'val_kl', 'tau_q_med', 'best_ep', 'pool_ok')
+    new = not os.path.exists(log_path)
+    with open(log_path, 'a') as fh:
+        if new:
+            fh.write(f'# label_metric={args.label_metric} pool={pool} start={settings.get("start_ckpt")}\n')
+            fh.write(' '.join(f'{c:>12s}' for c in cols) + '\n')
+        vals = (epoch_idx, tr.get('lr', nan), tr.get('listnet_loss', nan), tr.get('listnet_kl', nan),
+                tr.get('n_targets', nan), tr.get('selected_q', nan), top1, top1 - base,
+                _g('intrinsic_cdr_lddt_gap'), _g('holo/top1'), _g('apo/top1'),
+                _g('listnet_kl'), tr.get('tau_q_median', nan), bt.get('epoch', -1), int(ok))
+        fh.write(' '.join(f'{v:>12d}' if isinstance(v, int) else f'{v:>12.6g}' for v in vals) + '\n')
+    print(f'[listnet] epoch {epoch_idx}: loss={tr.get("listnet_loss", nan):.5f} '
+          f'kl={tr.get("listnet_kl", nan):.5f} train targets={tr.get("n_targets", nan):.0f} '
+          f'lr={tr.get("lr", nan):.3g} | {pool} top1={top1:.5f} (baseline {base:.5f}, {top1 - base:+.5f}) '
+          f'gap={_g("intrinsic_cdr_lddt_gap"):.5f} holo={_g("holo/top1"):.5f} apo={_g("apo/top1"):.5f} | '
+          f'{_listnet_teacher_line(tr, mv, pool)} | '
+          f'best epoch {bt.get("epoch")} ({bt.get("top1")}) | pool check '
+          f'{"ok" if ok else "FAILED " + str(rec["val_pool_problems"][:3])} | saved {saved} + last.pt',
+          flush=True)
+    if stop_now:
+        print(f'[listnet] STOP file {stop} found: ending after epoch {epoch_idx}', flush=True)
+    return stop_now
+
+
+def _listnet_reload_check(model, start_state, args, dataset_config, device, logger, result_dir, st,
+                          manifest_counts, local_rank):
+    net = model.module if hasattr(model, 'module') else model
+    pool = str(args.best_pool)
+    if dist.is_initialized():
+        dist.barrier()
+    last = torch.load(str(result_dir / 'last.pt'), map_location={'cuda:0': f'cuda:{local_rank}'})
+    live = net.state_dict()
+    differ = [k for k, v in last['state_dict'].items() if not torch.equal(v.to(live[k].device), live[k])]
+    moved = sum(1 for k, v in start_state.items() if not torch.equal(v.to(live[k].device), live[k]))
+    net.load_state_dict(start_state, strict=True)
+    net.load_state_dict(last['state_dict'], strict=True)
+    tag = 9000 + int(last['epoch'])
+    use_wandb, args.wandb = args.wandb, False
+    try:
+        mv, check = _listnet_validate(model, args, dataset_config, device, tag, logger,
+                                      manifest_counts, st.get('ref_counts'), local_rank)
+    finally:
+        args.wandb = use_wandb
+    if local_rank != 0:
+        return
+    want = next((r for r in reversed(st['history']) if r['epoch'] == int(last['epoch'])), {})
+    key = f'val/{pool}/intrinsic_top1_cdr_lddt'
+    got, exp = float(mv.get(key, float('nan'))), float(want.get(key, float('nan')))
+    same = bool(check and check['ok']) and not differ and abs(got - exp) <= 1e-4
+    print(f'[listnet smoke] reload last.pt (epoch {last["epoch"]}): tensors differing from memory='
+          f'{len(differ)}, tensors changed vs start checkpoint={moved}/{len(start_state)}, '
+          f'top1 after reload={got:.6f} vs recorded={exp:.6f} -> {"PASS" if same else "FAIL"}', flush=True)
+    if not same:
+        raise RuntimeError(f'[listnet smoke] checkpoint reload does not reproduce epoch {last["epoch"]}: '
+                           f'differ={differ[:5]} got={got} expected={exp} check={check and check["problems"]}')
+
+
+def finetune_listnet(model: nn.Module, callbacks: List[BaseCallback], logger: Logger, args):
+    device = torch.cuda.current_device()
+    local_rank = get_local_rank()
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    pool = str(getattr(args, 'best_pool', 'boltz2'))
+    dataset_config = getattr(args, 'dataset_config', None)
+    if not dataset_config:
+        raise ValueError('[listnet] --dataset_config is required')
+    from dataset.config import load_dataset_spec
+    spec = load_dataset_spec(dataset_config)
+    start = getattr(args, 'policy_init_ckpt', None) or getattr(args, 'reference_ckpt', None)
+    man_path = getattr(args, f'val_manifest_{pool}', None)
+    problems = []
+    if getattr(spec, 'sampler_mode', None) != 'listnet':
+        problems.append(f'dataset config needs "sampler_mode: listnet" (got {getattr(spec, "sampler_mode", None)!r})')
+    if spec.label_metric != 'fv_context_lddt':
+        problems.append(f'label_metric must be fv_context_lddt (got {spec.label_metric!r})')
+    if int(args.batch_size) != 1:
+        problems.append(f'--batch_size must be 1, one target group per batch (got {args.batch_size})')
+    if int(args.listnet_max_candidates) < 2:
+        problems.append(f'--listnet_max_candidates must be >= 2 (got {args.listnet_max_candidates})')
+    if not (float(args.listnet_tau_q) > 0 and float(args.listnet_tau_s) > 0):
+        problems.append(f'temperatures must be > 0 (tau_q={args.listnet_tau_q}, tau_s={args.listnet_tau_s})')
+    teacher = _listnet_teacher_cfg(args)
+    if teacher['mode'] not in ('fixed', 'adaptive_std'):
+        problems.append(f"--listnet_teacher must be fixed or adaptive_std (got {teacher['mode']!r})")
+    if teacher['mode'] == 'adaptive_std' and not teacher['floor'] > 0:
+        problems.append(f"--listnet_tau_q_floor must be > 0 (got {teacher['floor']})")
+    for flag in ('fnat_tier_topup', 'joint_cell_topup', 'cell_importance_weights',
+                 'use_ord_aux_loss', 'aux_fv_reg'):
+        if getattr(args, flag, None):
+            problems.append(f'--{flag} is not part of the ListNet mode (got {getattr(args, flag)!r})')
+    if not (start and os.path.exists(start)):
+        problems.append(f'start checkpoint not found: --policy_init_ckpt/--reference_ckpt = {start!r}')
+    if not (man_path and os.path.exists(man_path)):
+        problems.append(f'original validation manifest for pool "{pool}" not found: pass '
+                        f'--val_manifest_{pool} <manifest json> (got {man_path!r}); '
+                        f'no other validation pool is used in its place')
+    result_dir = _run_result_dir(args)
+    resume = str(args.load_ckpt_path) if args.load_ckpt_path else None
+    if resume and not os.path.exists(resume):
+        problems.append(f'--load_ckpt_path {resume} does not exist')
+    if not resume and result_dir.exists() and (
+            list(result_dir.glob('*.pt')) or (result_dir / 'listnet_history.json').exists()):
+        problems.append(f'{result_dir} already holds checkpoints: choose a new --param_name, '
+                        f'or resume with --load_ckpt_path {result_dir}/last.pt')
+    if start and pathlib.Path(start).resolve().parent == result_dir.resolve():
+        problems.append(f'--param_name points at the start checkpoint directory {result_dir}')
+    if resume and pathlib.Path(resume).resolve().parent != result_dir.resolve():
+        problems.append(f'--load_ckpt_path {resume} is outside this run directory {result_dir}')
+    if problems:
+        raise ValueError('[listnet] invalid setup:\n  - ' + '\n  - '.join(problems))
+
+    ck = torch.load(start, map_location={'cuda:0': f'cuda:{local_rank}'})
+    missing, unexpected = model.load_state_dict(ck['state_dict'], strict=False)
+    if missing or unexpected:
+        raise RuntimeError(f'[listnet] start checkpoint does not match the model: '
+                           f'missing={sorted(missing)}, unexpected={sorted(unexpected)}')
+    start_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    model.to(device=device)
+    optimizer = AdamW(_param_groups(model, args, local_rank, 'listnet'),
+                      lr=args.learning_rate, betas=(args.momentum, 0.999),
+                      weight_decay=args.weight_decay)
+    for callback in callbacks:
+        callback.on_fit_start(optimizer, args)
+    st = {'history': [], 'best': None, 'baseline': None, 'ref_counts': None}
+    epoch_start = 0
+    if resume:
+        rk = torch.load(resume, map_location={'cuda:0': f'cuda:{local_rank}'})
+        if 'listnet_state' not in rk:
+            raise RuntimeError(f'[listnet] {resume} is not a ListNet last.pt (no listnet_state)')
+        model.load_state_dict(rk['state_dict'], strict=True)
+        optimizer.load_state_dict(rk['optimizer_state_dict'])
+        for callback in callbacks:
+            callback.on_checkpoint_load(rk)
+        st, epoch_start = rk['listnet_state'], int(rk['epoch'])
+    if dist.is_initialized():
+        model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,
+                                        find_unused_parameters=True)
+
+    args.label_metric = spec.label_metric
+    args.near_native_cutoff = spec.effective_near_native_cutoff()
+    args._gen_source_ids = _resolve_gen_source_ids(args, spec, local_rank, 'listnet')
+    source_order = sorted(spec.sources)
+    enabled = sorted(spec.enabled_sources())
+    args._listnet_source_ids = [source_order.index(s) for s in enabled]
+    args.score_scatter_targets = 10 ** 9
+    args.score_scatter_dir = os.path.join(str(args.log_dir), 'predictions')
+    man_info, manifest_counts = _listnet_manifest_info(man_path)
+    excluded_pdbs = _load_excluded_pdbs(args)
+    train_pool, _, pool_meta = _prepare_yaml_abag_pools(spec, excluded_pdbs=excluded_pdbs)
+    kept, scan, per_target = _listnet_scan_groups(train_pool, dataset_config, args, local_rank)
+    adaptive = teacher['mode'] == 'adaptive_std'
+    q_sd = {t: float(per_target[t]['q_sd']) for t in kept}
+    args._listnet_tau_by_target = ({t: teacher_tau('adaptive_std', floor=teacher['floor'], q_sd=v)
+                                    for t, v in q_sd.items()} if adaptive else None)
+    tau_train = list(args._listnet_tau_by_target.values()) if adaptive else [teacher['tau_q']] * len(kept)
+    teacher_info = {
+        'mode': teacher['mode'],
+        'tau_q': None if adaptive else teacher['tau_q'],
+        'tau_q_floor': teacher['floor'] if adaptive else None,
+        'label_softmax': ('q / max(sd_t, floor), sd_t = population SD of q over the full valid candidate pool '
+                          'of the train group (computed once at the group scan)' if adaptive
+                          else f"q / {teacher['tau_q']}"),
+        'group_unit': f'target (candidates of the enabled sources {enabled} pooled)',
+        'train_group_q_sd': spread(q_sd.values()), 'train_tau_q': spread(tau_train),
+        'n_train_groups_at_floor': (sum(1 for v in q_sd.values() if v <= teacher['floor']) if adaptive else 0),
+        'n_train_groups': len(kept),
+    }
+    if local_rank == 0:
+        result_dir.mkdir(parents=True, exist_ok=True)
+    ck_top1 = (ck.get('metrics') or {}).get(f'val/{pool}/intrinsic_top1_cdr_lddt')
+    settings = {
+        'mode': 'listnet', 'objective': 'ListNet top-one cross-entropy only',
+        'tau_q': teacher_info['tau_q'], 'tau_s': float(args.listnet_tau_s), 'teacher': teacher_info,
+        'max_candidates': int(args.listnet_max_candidates),
+        'learning_rate': float(args.learning_rate), 'min_learning_rate': args.min_learning_rate,
+        'epochs': int(args.epochs), 'sch_type': args.sch_type, 'sch_T0': getattr(args, 'sch_T0', None),
+        'lr_warmup_epochs': args.lr_warmup_epochs, 'weight_decay': float(args.weight_decay),
+        'no_decay_heads': bool(getattr(args, 'no_decay_heads', False)),
+        'gradient_clip': args.gradient_clip, 'accumulate_grad_batches': int(args.accumulate_grad_batches),
+        'amp': bool(args.amp), 'seed': args.seed, 'world_size': world_size,
+        'start_ckpt': os.path.abspath(start), 'start_ckpt_epoch': ck.get('epoch'),
+        'start_ckpt_recorded_top1': ck_top1, 'resumed_from': resume,
+        'dataset_config': os.path.abspath(dataset_config), 'spec_seed': spec.seed,
+        'train_sources': enabled, 'source_index': {s: i for i, s in enumerate(source_order)},
+        'label_metric': spec.label_metric, 'label_column': 'fv_context_cdr_lddt',
+        'score_head': "pred['out'] (intrinsic head, linear_out_1)",
+        'best_pool': pool, 'val_manifest': man_info,
+        'selection': f'max val/{pool}/intrinsic_top1_cdr_lddt over epoch 0 (start weights) and trained epochs',
+        'predictions_dir': args.score_scatter_dir, 'train_pool': pool_meta, 'train_groups': scan,
+        'n_excluded_pdb_ids': len(excluded_pdbs or ()),
+        'train_subset': scan['train_subset'],
+    }
+    import json as _json
+    settings = _json.loads(_json.dumps(settings, default=str))
+    logger.log_hyperparams({'listnet': settings})
+    if local_rank == 0:
+        print(f'[listnet] start={start} (epoch {ck.get("epoch")}, recorded {pool} top1 {ck_top1}); '
+              f'sources={enabled} label={spec.label_metric} head=intrinsic; teacher={teacher_info["mode"]} '
+              f'({teacher_info["label_softmax"]}) tau_s={args.listnet_tau_s} '
+              f'max candidates={args.listnet_max_candidates} lr={args.learning_rate} epochs={args.epochs}; '
+              f'train subset={scan["train_subset"]} ({scan["n_targets_used_holo"]} holo + '
+              f'{scan["n_targets_used_apo"]} apo groups); '
+              f'validation={man_info}', flush=True)
+        print(f'[listnet] teacher: train group q SD min/median/max={teacher_info["train_group_q_sd"]}; '
+              f'train tau_q min/median/max={teacher_info["train_tau_q"]}; groups at floor='
+              f'{teacher_info["n_train_groups_at_floor"]}/{len(kept)}', flush=True)
+
+    if not resume:
+        mv0, check0 = _listnet_validate(model, args, dataset_config, device, 0, logger,
+                                        manifest_counts, None, local_rank)
+        if local_rank == 0:
+            if not (check0 and check0['ok']):
+                raise RuntimeError(f'[listnet] baseline validation on pool "{pool}" is incomplete: '
+                                   f'{check0["problems"] if check0 else "no metrics"}')
+            top0 = float(mv0[f'val/{pool}/intrinsic_top1_cdr_lddt'])
+            st['ref_counts'] = check0['counts']
+            st['baseline'] = {
+                'epoch': 0, 'top1': top0, 'n_targets': check0['n_targets'],
+                'n_candidates': check0['n_candidates'],
+                'start_ckpt_recorded_top1': ck_top1,
+                'top1_minus_recorded': (top0 - float(ck_top1)) if ck_top1 is not None else None,
+                'metrics': _listnet_floats(mv0)}
+
+            def _b(k):
+                return float(mv0.get(f'val/{pool}/{k}', float('nan')))
+            st['best'] = {'epoch': 0, 'top1': top0, 'gap': _b('intrinsic_cdr_lddt_gap'),
+                          'holo_top1': _b('holo/top1'), 'apo_top1': _b('apo/top1'), 'top1_minus_baseline': 0.0}
+            net0 = model.module if hasattr(model, 'module') else model
+            torch.save({'state_dict': net0.state_dict(), 'epoch': 0, 'metrics': st['baseline']['metrics']},
+                       str(result_dir / 'best_top1.pt'))
+            if getattr(args, 'wandb', False):
+                logger.log_metrics({**_listnet_teacher_metrics(mv0, pool), 'best/top1_epoch': 0.0,
+                                    'best/top1': top0, 'epoch': 0})
+            _listnet_write_history(result_dir, settings, st)
+            print(f'[listnet] baseline (epoch 0, no training): {pool} top1={top0:.6f} on '
+                  f'{check0["n_targets"]} targets / {check0["n_candidates"]} candidates; '
+                  f'start checkpoint recorded {ck_top1} '
+                  f'(diff {st["baseline"]["top1_minus_recorded"]}); {_listnet_teacher_line(None, mv0, pool)}; '
+                  f'saved best_top1 (epoch 0, start weights)', flush=True)
+            if ck_top1 is not None and abs(top0 - float(ck_top1)) > 1e-4:
+                if int(getattr(args, 'listnet_smoke_targets', 0) or 0) > 0:
+                    raise RuntimeError(f'[listnet smoke] baseline {top0:.6f} does not reproduce the '
+                                       f'start checkpoint value {float(ck_top1):.6f}')
+                print('[listnet] WARNING baseline does not reproduce the value stored in the '
+                      'start checkpoint', flush=True)
+        if args.seed is not None:
+            seed_everything(args.seed)
+    else:
+        _restore_rng(rk['rng'])
+        if epoch_start >= int(args.epochs):
+            raise RuntimeError(f'[listnet] nothing to do: {resume} is at epoch {epoch_start} and '
+                               f'--epochs (the total) is {args.epochs}')
+        if local_rank == 0:
+            print(f'[listnet] resumed from {resume} at epoch {epoch_start}; running to epoch '
+                  f'{args.epochs}', flush=True)
+
+    data_module = HUDataModule(batch_size=1, num_workers=int(args.num_workers))
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    for epoch_idx in range(epoch_start + 1, int(args.epochs) + 1):
+        training_list = epoch_order(kept, args.seed, epoch_idx)
+        train_dataloader = data_module.train_dataloader(training_list, args.decoytype,
+                                                        dataset_config=dataset_config)
+        data_module.ds_train.set_epoch(epoch_idx)
+        model.train()
+        ep_train = run_epoch_listnet(model, train_dataloader, epoch_idx, grad_scaler, optimizer,
+                                     local_rank, callbacks, args)
+        mv, check = _listnet_validate(model, args, dataset_config, device, epoch_idx, logger,
+                                      manifest_counts, st.get('ref_counts'), local_rank)
+        for callback in callbacks:
+            callback.on_epoch_end()
+        if _listnet_epoch_end(model, optimizer, callbacks, epoch_idx, mv, check, ep_train, st,
+                              settings, args, result_dir, logger, local_rank):
+            break
+    if int(getattr(args, 'listnet_smoke_targets', 0) or 0) > 0 and not resume \
+            and (result_dir / 'last.pt').exists():
+        _listnet_reload_check(model, start_state, args, dataset_config, device, logger, result_dir,
+                              st, manifest_counts, local_rank)
+    for callback in callbacks:
+        callback.on_fit_end()
+
+
 def finetune(
         model: nn.Module,
         callbacks: List[BaseCallback],
@@ -3062,6 +3830,12 @@ def finetune(
     if getattr(args, 'ab_protocol', False):
         # A/B: the only key allowed to be absent is the new arm-B head; nothing unexpected
         _allowed = {'aux_reg_head.weight', 'aux_reg_head.bias'} if getattr(args, 'aux_fv_reg', False) else set()
+        if getattr(args, 'atom_encoder', False):
+            # Arm B's atom pathway cannot be in a backbone-only reference ckpt.
+            # atom_to_res is zero-initialised, so the reference still scores
+            # exactly as the backbone-only model it was trained as.
+            _allowed |= {k for k in _ref_missing
+                         if k.startswith(('atom_encoder.', 'atom_to_res.'))}
         _bad_m = sorted(set(_ref_missing) - _allowed)
         if local_rank == 0:
             print(f'[ab] checkpoint keys: missing={sorted(_ref_missing)} unexpected={sorted(_ref_unexpected)} '
@@ -3072,6 +3846,15 @@ def finetune(
         if dist.is_initialized() and world_size > 1:
             raise RuntimeError('[ab] --ab_protocol runs on one GPU (no DDP); start it with GPUS=1')
     pre_trained = copy.deepcopy(model)
+    if getattr(args, 'atom_encoder', False) and any(
+            k.startswith(('atom_encoder.', 'atom_to_res.')) for k in _ref_missing):
+        # The reference is frozen and its atom_to_res is still zero, so the atom
+        # pathway contributes exactly nothing to its scores. Skip it rather than
+        # pay for a block whose output is multiplied by zero.
+        pre_trained.use_atom_encoder = False
+        if local_rank == 0:
+            print('[ab] reference keeps the backbone-only pathway '
+                  '(atom_to_res is zero there)', flush=True)
     pre_trained.half()
     for param in pre_trained.parameters():
         param.requires_grad = False
@@ -3082,7 +3865,11 @@ def finetune(
     if not fresh_c1:
         pol_ck = torch.load(policy_init_path, map_location={'cuda:0': f'cuda:{local_rank}'})
         _pm, _pu = model.load_state_dict(pol_ck['state_dict'], strict=False)
-        if getattr(args, 'ab_protocol', False) and (_pu or set(_pm) - {'aux_reg_head.weight', 'aux_reg_head.bias'}):
+        _pol_allowed = {'aux_reg_head.weight', 'aux_reg_head.bias'}
+        if getattr(args, 'atom_encoder', False):
+            _pol_allowed |= {k for k in _pm
+                             if k.startswith(('atom_encoder.', 'atom_to_res.'))}
+        if getattr(args, 'ab_protocol', False) and (_pu or set(_pm) - _pol_allowed):
             raise RuntimeError(f'[ab] policy checkpoint key mismatch: missing={_pm}, unexpected={_pu}')
         if local_rank == 0:
             print(f'[finetune] policy init = {policy_init_path} (continue prior Phase-C)')
@@ -3198,6 +3985,20 @@ def finetune(
                 print(f'[finetune vanilla] share {args.vanilla_share:.2f} on groups {_vs} (pairs never cross '
                       f'groups), 1 - share on the other groups, for DPO and SML; vanilla DPO '
                       f'{"plain pair mean" if args.vanilla_dpo_uniform else "type-weighted"}', flush=True)
+        # decoy scheduling: in-batch re-weighting of the comparisons that move the current pick
+        if bool(getattr(args, 'pair_sched', False)):
+            if not getattr(args, 'dpo_typed_pairs', False):
+                raise RuntimeError('--pair_sched needs --dpo_typed_pairs (the pair loss it re-weights)')
+            _ps = float(getattr(args, 'pair_sched_share', 0.0))
+            if not (0.0 < _ps < 1.0):
+                raise RuntimeError(f'--pair_sched_share must be in (0, 1), got {_ps}')
+            if int(getattr(args, 'pair_sched_topk', 1)) < 1:
+                raise RuntimeError('--pair_sched_topk must be >= 1')
+            if local_rank == 0:
+                print(f'[finetune decoy-sched] pair loss = {_ps:.2f} * mean(pairs whose lower-label side '
+                      f'is in the current top-{args.pair_sched_topk} of its group, label margin '
+                      f'>= {args.pair_sched_min_delta}) + {1 - _ps:.2f} * mean(rest); warmup '
+                      f'{args.pair_sched_warmup_epochs} epoch(s); SML unchanged', flush=True)
         # A/B arm B: the regression source, resolved by EXACT name (Boltz2_s10n10 != Boltz2)
         args._aux_reg_sid = None
         if getattr(args, 'aux_fv_reg', False):
@@ -3585,20 +4386,19 @@ def finetune(
                 v = epoch_loss[key]
                 return v.item() if isinstance(v, torch.Tensor) else v
 
-            # Name the wandb keys after the ACTUAL metric: the internal
-            # epoch_loss['top1_rmsd'] etc. hold the label metric (cdr_lddt when
-            # label_metric=loop_lddt), NOT Angstrom RMSD. Suffix by label_metric so
-            # the panel name matches the value (matches the pretrain rename above).
+            # Name the wandb keys after the ACTUAL metric: epoch_loss['top1_metric']
+            # etc. hold whatever --label_metric is, so suffix by label_metric and the
+            # panel name matches the value (matches the pretrain rename above).
             _lm = str(getattr(args, 'label_metric', 'loop_rmsd')).lower()
             _suf = 'cdr_lddt' if 'lddt' in _lm else 'rmsd'
             log_dict = {
                 "valid/loss": epoch_loss['final_loss'],
                 "valid/best_rank": epoch_loss['best_rank'],
-                f"valid/top1_{_suf}": epoch_loss['top1_rmsd'],
-                f"valid/top3_{_suf}": epoch_loss['top3_rmsd'],
-                f"valid/top5_{_suf}": epoch_loss['top5_rmsd'],
-                f"valid/top10_{_suf}": epoch_loss['top10_rmsd'],
-                f"valid/{_suf}_diff": epoch_loss['rmsd_diff'],
+                f"valid/top1_{_suf}": epoch_loss['top1_metric'],
+                f"valid/top3_{_suf}": epoch_loss['top3_metric'],
+                f"valid/top5_{_suf}": epoch_loss['top5_metric'],
+                f"valid/top10_{_suf}": epoch_loss['top10_metric'],
+                f"valid/{_suf}_diff": epoch_loss['metric_diff'],
                 "learning_rate": current_lr,
                 "epoch": epoch_idx,
             }
@@ -3895,9 +4695,9 @@ def inference(model: nn.Module,
             if decoy_meta is not None:
                 info_dict[pdb]['decoys'] = decoy_meta
 
-            # Rename rmsd_diff -> rmsd_regret
-            if 'rmsd_diff' in info_dict[pdb]:
-                info_dict[pdb]['rmsd_regret'] = info_dict[pdb].pop('rmsd_diff')
+            # Rename metric_diff -> rmsd_regret
+            if 'metric_diff' in info_dict[pdb]:
+                info_dict[pdb]['rmsd_regret'] = info_dict[pdb].pop('metric_diff')
 
             if show_progress:
                 agl = info_dict[pdb].get('ag_local_rmsd')
@@ -4023,7 +4823,8 @@ if __name__ == '__main__':
             dataset_config=args.dataset_config,
             run_script=getattr(args, 'run_script', None),
         )
-    if getattr(args, 'ab_protocol', False) and get_local_rank() == 0:
+    if (getattr(args, 'ab_protocol', False) or str(getattr(args, 'loss_type', '')) == 'listnet') \
+            and get_local_rank() == 0:
         # code identity: commit + hash of the uncommitted diff (saved next to the run)
         import subprocess, hashlib
         _root = str(pathlib.Path(_CURRENT_LIBS_DIR).parent)
@@ -4052,6 +4853,9 @@ if __name__ == '__main__':
             except Exception as _e:
                 logging.warning('[ab] could not attach code diff: %s', _e)
 
+    # The epoch log's top{k}_metric columns are metric-agnostic by name; this is
+    # what lets a reader tell an lDDT log from an RMSD one.
+    os.environ['CDR_LABEL_METRIC'] = str(getattr(args, 'label_metric', '') or 'unset')
     if get_local_rank() == 0:
         print('se3 config loss ',se3_config.loss.weight)
     increase_l2_fetch_granularity()
@@ -4061,7 +4865,10 @@ if __name__ == '__main__':
         train(model,callbacks, logger, args)
         logging.info('Training finished successfully')
     elif args.run_type=='finetune':
-        finetune(model, callbacks, logger, args)
+        if str(getattr(args, 'loss_type', '')) == 'listnet':
+            finetune_listnet(model, callbacks, logger, args)
+        else:
+            finetune(model, callbacks, logger, args)
         logging.info('Fine-tuning finished successfully')
     elif args.run_type=='inference':
         trained_model_dir = f'{args.save_model_path}'

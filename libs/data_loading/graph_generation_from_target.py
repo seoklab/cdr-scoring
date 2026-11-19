@@ -3,7 +3,8 @@ import torch
 import numpy as np
 from Bio.PDB.Polypeptide import is_aa
 from data_loading import coords_rosetta6d
-from .constants import MAX_REL_INDEX, AA3_IDX, restype_name_to_atom14_names, MAX_NUM_ATOM, REF_CHAIN
+from .constants import (MAX_REL_INDEX, AA3_IDX, restype_name_to_atom14_names, MAX_NUM_ATOM,
+                        REF_CHAIN)
 import random
 import re
 import logging
@@ -304,6 +305,7 @@ def create_dictionary_from_model(
     graph_crop_debug=False,
     target_id=None,
     profile_timings=None,
+    atom_graph=False,
 ):
     """
     Processes a Bio.PDB structure (Model object) and returns a dictionary with 
@@ -323,6 +325,8 @@ def create_dictionary_from_model(
     orig_resseq_list = []    # Original residue numbers (integer part)
     chain_ids = []           # Chain IDs
     aa_types = []            # Residue names
+    atom_xyz_list = []       # (14,3) atom14 heavy-atom coords, side chains included
+    atom_mask_list = []      # (14,) 1 where that atom14 slot is present in the model
 
     if use_all_atom:
         def get_expected_atoms(resname):
@@ -347,6 +351,20 @@ def create_dictionary_from_model(
             orig_resseq_list.append(res.id[1])
             chain_ids.append(chain.id)
             aa_types.append(res.get_resname())
+            if atom_graph:
+                # Full heavy-atom set in fixed atom14 order (same order as
+                # constants.ATOM14_TYPE_IDX), so the atom encoder can read atom
+                # identity straight from the residue type without storing it.
+                a14_names = restype_name_to_atom14_names.get(
+                    res.get_resname(), restype_name_to_atom14_names['UNK'])
+                a_xyz = np.zeros((MAX_NUM_ATOM, 3), dtype=np.float32)
+                a_msk = np.zeros((MAX_NUM_ATOM,), dtype=np.uint8)
+                for slot, aname in enumerate(a14_names):
+                    if aname and aname in res:
+                        a_xyz[slot] = res[aname].get_coord()
+                        a_msk[slot] = 1
+                atom_xyz_list.append(a_xyz)
+                atom_mask_list.append(a_msk)
     
     if len(ca_coords_list) == 0:
         raise ValueError("No valid CA atoms found in the structure.")
@@ -371,6 +389,9 @@ def create_dictionary_from_model(
         orig_resseq_list = [orig_resseq_list[i] for i in selected_indices]
         chain_ids = [chain_ids[i] for i in selected_indices]
         aa_types = [aa_types[i] for i in selected_indices]
+        if atom_graph:
+            atom_xyz_list = [atom_xyz_list[i] for i in selected_indices]
+            atom_mask_list = [atom_mask_list[i] for i in selected_indices]
     
     L = len(ca_coords_list)
     all_coords = np.stack(all_coords_list, axis=0)    # (L, max_atoms,3)
@@ -464,6 +485,9 @@ def create_dictionary_from_model(
     dic['theta6d'] = theta6d
     dic['phi_res'] = phi_res
     dic['psi_res'] = psi_res
+    if atom_graph:
+        dic['atom_xyz'] = torch.from_numpy(np.stack(atom_xyz_list, axis=0))   # (L,14,3)
+        dic['atom_mask'] = torch.from_numpy(np.stack(atom_mask_list, axis=0))  # (L,14)
 
     _profile_add(profile_timings, "cdr_crop_time", crop_time)
     _profile_add(profile_timings, "node_feature_time", time.perf_counter() - t_start - crop_time)
@@ -633,6 +657,13 @@ def build_graph(dic, use_all_atom=False, dist_cut_off=10.0, max_neighbors=0, pro
         l1 = heavy_coords - ca_tensor.unsqueeze(1)           # (L, 4, 3)
         g.ndata['l1'] = l1
 
+    if 'atom_xyz' in dic:
+        # Side-chain atom encoder input. Stored as raw coords (not CA-relative):
+        # the encoder derives its own invariant features (distances + directions
+        # in each residue's backbone frame), so nothing here assumes a frame.
+        g.ndata['atom_xyz'] = dic['atom_xyz']
+        g.ndata['atom_mask'] = dic['atom_mask']
+
     _profile_add(profile_timings, "dgl_graph_build_time", time.perf_counter() - t_dgl)
     return g
 
@@ -652,6 +683,7 @@ def generate_graphs_from_target(
     max_context_residues=120,
     graph_crop_debug=False,
     target_id=None,
+    atom_graph=False,
 ):
     """
     For each model in the Target object, creates a dictionary via create_dictionary_from_model,
@@ -676,6 +708,7 @@ def generate_graphs_from_target(
             max_context_residues=max_context_residues,
             graph_crop_debug=graph_crop_debug,
             target_id=target_id,
+            atom_graph=atom_graph,
         )
         dist_cutoff = dist_cutoff_center + random.uniform(-random_range, random_range) if random_range > 0 else dist_cutoff_center
         dic = build_edge_mask(dic, dist_cut_off=dist_cutoff)

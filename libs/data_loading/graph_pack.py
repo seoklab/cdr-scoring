@@ -127,7 +127,7 @@ def compute_code_sig(extra_paths: Sequence[str] = ()) -> str:
 #     read narrows edges by distance from the wide envelope.
 BUILD_SIG_EXACT_KEYS = (
     'max_neighbors', 'use_all_atom', 'cdr_context_cutoff', 'max_context_residues',
-    'h3_range', 'cdr_ranges', 'task_scope',
+    'h3_range', 'cdr_ranges', 'task_scope', 'atom_graph',
 )
 COVERAGE_KEY = 'dist_cutoff'
 

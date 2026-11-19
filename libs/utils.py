@@ -86,11 +86,16 @@ def report_epoch_loss(epoch_loss,epoch_idx,mode,out_tag=None):
         with open(log_path) as fp:
             wrt=fp.readlines()
     else:
+        # The top{k}_metric / metric_diff columns carry whatever --label_metric
+        # is, so record which one that was: the column names stay true if the
+        # run switches back to an RMSD label, but only this line says which.
+        lm = os.environ.get('CDR_LABEL_METRIC')
+        wrt = ['# label_metric=%s\n' % lm] if lm else []
         header='%10i '%epoch_idx
         for key in se3_config.loss.weight.keys():
             header+='%10s '%key
         header+='\n'
-        wrt=[header]
+        wrt.append(header)
     sen='%10i '%epoch_idx
     for key in se3_config.loss.weight.keys():
         if mode =='train':

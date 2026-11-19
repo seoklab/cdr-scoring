@@ -237,6 +237,27 @@ PARSER.add_argument('--best_pool', type=str, default='boltz2',
 PARSER.add_argument('--aux_fv_reg', action='store_true', default=False,
                     help='Arm B: independent linear head on the pooled feature regressing the whole '
                          'Fv-context CDR-lDDT of --aux_reg_source candidates (eps-insensitive, FP32).')
+# ── side-chain branch: atom-level encoder in front of the residue trunk ──────
+PARSER.add_argument('--atom_encoder', action='store_true', default=False,
+                    help='Arm B: encode atom14 heavy atoms (side chains included) with a sparse '
+                         'atom attention block and add the per-residue pooling to the node embedding. '
+                         'Requires graph_build.atom_graph: true in the dataset YAML.')
+PARSER.add_argument('--atom_dim', type=int, default=32, help='Atom encoder feature width.')
+PARSER.add_argument('--atom_layers', type=int, default=2, help='Atom attention blocks.')
+PARSER.add_argument('--atom_heads', type=int, default=4, help='Atom attention heads.')
+PARSER.add_argument('--atom_radius', type=float, default=5.0,
+                    help='Atom-atom neighbour cutoff in Angstrom.')
+PARSER.add_argument('--atom_res_cutoff', type=float, default=8.0,
+                    help='Only residue pairs with CA-CA below this are expanded into atom pairs.')
+PARSER.add_argument('--atom_max_neighbors', type=int, default=24,
+                    help='Per-atom neighbour cap, nearest first.')
+PARSER.add_argument('--atom_grad_checkpoint', action='store_true', default=False,
+                    help='Recompute atom attention blocks in backward instead of storing '
+                         'their activations. Same parameters, same math, same state dict -- '
+                         'only slower. Unlike --low_memory it does not relayout the SE3 convs.')
+PARSER.add_argument('--atom_lr_mult', type=float, default=10.0,
+                    help='Learning-rate multiplier for the freshly initialised atom encoder '
+                         '(the trunk is being fine-tuned, the encoder is training from scratch).')
 PARSER.add_argument('--aux_reg_source', type=str, default='Boltz2_s10n10',
                     help='Exact source name whose candidates get the regression target.')
 PARSER.add_argument('--aux_prep_epochs', type=int, default=1,
@@ -262,6 +283,26 @@ PARSER.add_argument('--wandb_require_online', action='store_true', default=False
 PARSER.add_argument('--vanilla_dpo_uniform', action='store_true', default=False,
                     help='fvctx DPO: vanilla pairs enter as a plain mean over pairs (no near/non type '
                          'weights), so the natural small-delta pairs are not down-weighted.')
+# ── decoy scheduling (2026-11-07): emphasise the comparisons that would change the current pick ──
+PARSER.add_argument('--pair_sched', action='store_true', default=False,
+                    help='In-batch selection-aware pair weighting. The scores of THIS forward pass '
+                         'decide which pairs matter: inside every pair group, a pair whose '
+                         'LOWER-label candidate is currently in the top --pair_sched_topk by model '
+                         'score is "selection-critical" (fixing it moves the group top1). The pair '
+                         'loss becomes share * mean(critical) + (1 - share) * mean(rest). Needs '
+                         '--dpo_typed_pairs. Off = byte-identical to the old behaviour.')
+PARSER.add_argument('--pair_sched_share', type=float, default=0.3,
+                    help='Share of the pair loss given to the selection-critical pairs (0-1). The '
+                         'split is skipped for a group that has none (the pick is already its best) '
+                         'or only critical pairs, so the loss scale never changes.')
+PARSER.add_argument('--pair_sched_topk', type=int, default=1,
+                    help='A pair counts as critical when its lower-label candidate is among the top '
+                         'K scoring candidates of its pair group. 1 = exactly the current pick.')
+PARSER.add_argument('--pair_sched_min_delta', type=float, default=0.0,
+                    help='Extra label margin a critical pair must clear (on top of '
+                         '--dpo_pair_min_delta): how much better the challenger has to be.')
+PARSER.add_argument('--pair_sched_warmup_epochs', type=int, default=0,
+                    help='Epochs at the start of training that run with the re-weighting off.')
 PARSER.add_argument('--dpo_policy_head', choices=['final', 'intrinsic'], default='final',
                     help='exp9: which head the DPO gradient trains. intrinsic is the '
                          'head test inference actually reads; exp6 trained `final` and '
@@ -336,6 +377,24 @@ PARSER.add_argument('--val_manifest_controlled', type=str, default=None,
 PARSER.add_argument('--manifest_val_interval', type=int, default=1,
                     help='Run the fixed-manifest validation every N epochs (it rebuilds '
                          'graphs on the fly, so it is expensive). 0/1 = every epoch.')
+
+PARSER.add_argument('--listnet_tau_q', type=float, default=0.01,
+                    help='--loss_type listnet: temperature of the label softmax.')
+PARSER.add_argument('--listnet_tau_s', type=float, default=1.0,
+                    help='--loss_type listnet: temperature of the score softmax.')
+PARSER.add_argument('--listnet_max_candidates', type=int, default=64,
+                    help='--loss_type listnet: max same-target candidates per group.')
+PARSER.add_argument('--listnet_teacher', type=str, default='fixed', choices=['fixed', 'adaptive_std'],
+                    help='--loss_type listnet: label softmax temperature, fixed --listnet_tau_q or per target '
+                         'max(population SD of the target q, --listnet_tau_q_floor).')
+PARSER.add_argument('--listnet_tau_q_floor', type=float, default=0.005,
+                    help='--loss_type listnet, --listnet_teacher adaptive_std: lower bound of the per-target tau_q.')
+PARSER.add_argument('--listnet_train_subset', type=str, default='all', choices=['all', 'holo', 'apo'],
+                    help='--loss_type listnet: train on every valid target group, or only the holo '
+                         '(antigen-bearing, existing fnat gate applied) or only the apo groups. '
+                         'Validation is unchanged.')
+PARSER.add_argument('--listnet_smoke_targets', type=int, default=0,
+                    help='--loss_type listnet: train on the first N valid targets only (0 = all).')
 
 # ── graph cache (Layer-B indexed containers; preprocess/build_graph_cache.py) ──
 PARSER.add_argument('--graph_cache_mode', type=str, default='off', choices=['off', 'read'],

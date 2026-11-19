@@ -1,0 +1,63 @@
+ckpt dir                              마지막       회수      삭제/전체  보존
+-----------------------------------------------------------------------------------------------------------------------------
+v2_iface_exp3_af3matched              67일    1029MB   99/100    v2_iface_exp3_af3matched_100.pt(last)
+v2_exp7b_tier2d                       60일     998MB   96/100    v2_exp7b_tier2d_100.pt(last), v2_exp7b_tier2d_13.pt(dump:exp7b_ms13), v2_exp7b_tier2d_14.pt(dump:exp7b_bz14), v2_exp7b_tier2d_7.pt(dump:exp7b_bz14)
+v2_exp7all_tier2d                     60일     987MB   95/100    v2_exp7all_tier2d_100.pt(last), v2_exp7all_tier2d_41.pt(dump:exp7all_bz41), v2_exp7all_tier2d_42.pt(dump:exp7all_bz42), v2_exp7all_tier2d_44.pt(dump:exp7all_ms44), v2_exp7all_tier2d_7.pt(dump:exp7all_bz42)
+v2_exp4_gate_rescue                   62일     863MB   83/88     v2_exp4_gate_rescue_2.pt(dump:exp4_A2), v2_exp4_gate_rescue_27.pt(dump:exp4_F27), v2_exp4_gate_rescue_37.pt(dump:exp4_I37), v2_exp4_gate_rescue_4.pt(dump:exp4_F27), v2_exp4_gate_rescue_88.pt(last)
+v2_exp5_gate_tier_pair                62일     853MB   82/87     v2_exp5_gate_tier_pair_2.pt(dump:exp5_A2), v2_exp5_gate_tier_pair_27.pt(dump:exp5_I27), v2_exp5_gate_tier_pair_39.pt(dump:exp5_F39), v2_exp5_gate_tier_pair_5.pt(dump:exp5_F39), v2_exp5_gate_tier_pair_87.pt(last)
+v2_exp41_cell_importance              62일     811MB   78/83     v2_exp41_cell_importance_18.pt(dump:exp41_I18), v2_exp41_cell_importance_2.pt(dump:exp41_A2), v2_exp41_cell_importance_32.pt(dump:exp41_F32), v2_exp41_cell_importance_41.pt(dump:exp41_F32), v2_exp41_cell_importance_83.pt(last)
+fvctx_sml                             30일     779MB   75/81     fvctx_sml_24.pt(dump:fvctx_sml_24), fvctx_sml_60.pt(dump:fvctx_sml_swa60_80), fvctx_sml_66.pt(dump:fvctx_sml_66), fvctx_sml_78.pt(dump:fvctx_sml_78), fvctx_sml_80.pt(dump:fvctx_sml_swa60_80), fvctx_sml_swa60_80.pt(last)
+v2_exp51_cell_imp_cdrpair             62일     769MB   74/79     v2_exp51_cell_imp_cdrpair_2.pt(dump:exp51_A2), v2_exp51_cell_imp_cdrpair_25.pt(dump:exp51_I25), v2_exp51_cell_imp_cdrpair_30.pt(dump:exp51_F30), v2_exp51_cell_imp_cdrpair_51.pt(dump:exp51_F30), v2_exp51_cell_imp_cdrpair_79.pt(last)
+v2_exp8                               58일     748MB   72/77     v2_exp8_15.pt(dump:exp8_ms15), v2_exp8_25.pt(dump:exp8_bz25), v2_exp8_59.pt(dump:exp8_ep59), v2_exp8_77.pt(last), v2_exp8_8.pt(dump:exp8_ms15)
+v0_cdr_lddt                           90일     509MB   49/50     v0_cdr_lddt_100.pt(last)
+v1gp                                  94일     509MB   49/50     v1gp_100.pt(last)
+v2_exp6_gengen                        62일     447MB   43/47     v2_exp6_gengen_2.pt(dump:exp6_bz2), v2_exp6_gengen_41.pt(dump:exp6_ms41), v2_exp6_gengen_47.pt(last), v2_exp6_gengen_6.pt(dump:exp6_ms41)
+v2_iface_tierbal                      68일     447MB   43/44     v2_iface_tierbal_88.pt(last)
+v2_iface_tierbal_nogate               68일     416MB   40/41     v2_iface_tierbal_nogate_82.pt(last)
+v1_cdr_lddt_h3aux                     96일     416MB   40/41     v1_cdr_lddt_h3aux_82.pt(last)
+v2_iface_sr_reg_fix                   69일     405MB   39/40     v2_iface_sr_reg_fix_80.pt(last)
+v2_iface_sr_fix                       69일     395MB   38/39     v2_iface_sr_fix_78.pt(last)
+v2_pretrainA_iface                    70일     343MB   33/34     v2_pretrainA_iface_68.pt(last)
+v2_phaseC3                            89일     281MB   27/30     v2_phaseC3_3.pt(dump:C3_ep8[intrinsic]), v2_phaseC3_30.pt(last), v2_phaseC3_8.pt(dump:C3_ep8[intrinsic])
+v2_phaseC2                            89일     281MB   27/30     v2_phaseC2_2.pt(dump:C2_ep22[final]), v2_phaseC2_22.pt(dump:C2_ep22[final]), v2_phaseC2_30.pt(last)
+v2_exp9b                              56일     281MB   27/30     v2_exp9b_3.pt(dump:exp9b_bz3), v2_exp9b_30.pt(last), v2_exp9b_9.pt(dump:exp9b_bz3)
+v2_exp9a                              56일     281MB   27/30     v2_exp9a_22.pt(dump:exp9a_ms22), v2_exp9a_30.pt(last), v2_exp9a_9.pt(dump:exp9a_ms22)
+v2_phaseC1                            91일     270MB   26/30     v2_phaseC1_1.pt(dump:C1_ep30[intrinsic]), v2_phaseC1_26.pt(dump:C1_ep26_H3best[final]), v2_phaseC1_3.pt(dump:C1_ep26_H3best[final]), v2_phaseC1_30.pt(last)
+v2_pretrainB                          91일     270MB   26/27     v2_pretrainB_62.pt(last)
+fvctx_pair_split                      31일     218MB   21/22     fvctx_pair_split_22.pt(last)
+fvctx_pair_merge                      31일     187MB   18/19     fvctx_pair_merge_19.pt(last)
+v2_iface_exp3_noamp                   64일     156MB   15/16     v2_iface_exp3_noamp_16.pt(last)
+_old_v2_exp9a_initEp25                58일     125MB   12/13     v2_exp9a_13.pt(last)
+fvctx_dpo_boltz2_cm_pmd               31일      94MB    9/10     fvctx_dpo_boltz2_cm_pmd_10.pt(last)
+fvctx_dpo2_cm_pmd_nodelta             30일      83MB    8/10     fvctx_dpo2_cm_pmd_nodelta_10.pt(last), fvctx_dpo2_cm_pmd_nodelta_2.pt(dump:fvctx_dpo2_cm_pmd_nodelta_10)
+fvctx_dpo_swa_cm_pmd                  30일      83MB    8/10     fvctx_dpo_swa_cm_pmd_10.pt(last), fvctx_dpo_swa_cm_pmd_5.pt(dump:fvctx_dpo_swa_cm_pmd_5)
+fvctx_dpo_boltz2                      31일      62MB    6/10     fvctx_dpo_boltz2_1.pt(dump:fvctx_dpo_boltz2_1), fvctx_dpo_boltz2_10.pt(last), fvctx_dpo_boltz2_2.pt(dump:fvctx_dpo_boltz2_2), fvctx_dpo_boltz2_3.pt(dump:fvctx_dpo_boltz2_3)
+_old_v2_exp9b_initEp25                58일      62MB    6/7      v2_exp9b_7.pt(last)
+v2_iface_softrank                     70일      52MB    5/6      v2_iface_softrank_12.pt(last)
+v2_pretrainA                          92일      42MB    4/6      v2_pretrainA_12.pt(last), v2_pretrainA_8.pt(dump:A_ep8[intrinsic])
+v2_iface_softrank_fnatreg             70일      31MB    3/4      v2_iface_softrank_fnatreg_8.pt(last)
+v2_phaseC_smoke                       94일      10MB    1/2      v2_phaseC_smoke_2.pt(last)
+v2_exp8_smoke3                        59일      10MB    1/2      v2_exp8_smoke3_2.pt(last)
+v2_smokeC2                            94일      10MB    1/2      v2_smokeC2_2.pt(last)
+v2_exp6_smoke                         63일       0MB    0/1      v2_exp6_smoke_1.pt(last)
+v2_exp6all_tier2d                     62일       0MB    0/1      v2_exp6all_tier2d_1.pt(last)
+v2_exp6b_tier2d                       62일       0MB    0/1      v2_exp6b_tier2d_1.pt(last)
+v2_exp8_smoke2                        59일       0MB    0/1      v2_exp8_smoke2_1.pt(last)
+v2_exp9_smoke                         58일       0MB    0/1      v2_exp9_smoke_1.pt(last)
+v2_smoke                              94일       0MB    0/1      v2_smoke_2.pt(last)
+v2_smokeA                             94일       0MB    0/1      v2_smokeA_2.pt(last)
+v2_smokeA_ddp                         93일       0MB    0/1      v2_smokeA_ddp_2.pt(last)
+v2_smokeC2b                           94일       0MB    0/1      v2_smokeC2b_1.pt(last)
+-----------------------------------------------------------------------------------------------------------------------------
+합계: 48개 디렉터리에서 1406개 파일, 14.3 GB 회수
+
+손대지 않음 (30일 이내 또는 실행 중):
+  fvctx_ab_B_within_source_s10reg     30개 스냅샷 (302MB 상당)  [14일 전]
+  fvctx_ab_A_within_source            30개 스냅샷 (302MB 상당)  [14일 전]
+  fvctx_ab_smoke_B3                    3개 스냅샷 (21MB 상당)  [15일 전]
+  fvctx_ab_smoke_A3                    3개 스냅샷 (21MB 상당)  [15일 전]
+  fvctx_ab_smoke_B                     2개 스냅샷 (10MB 상당)  [15일 전]
+  fvctx_ab_smoke_A                     2개 스냅샷 (10MB 상당)  [15일 전]
+  fvctx_vanilla_ft                    10개 스냅샷 (0MB 상당)  [16일 전]
+  sc_pilot_A_backbone                  1개 스냅샷 (0MB 상당)  [RUNNING]
+  sc_pilot_B_atom                      1개 스냅샷 (0MB 상당)  [RUNNING]

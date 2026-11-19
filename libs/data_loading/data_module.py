@@ -11,8 +11,10 @@ from data_loading.graph_generation_from_target import (
 )
 from runtime.utils import get_local_rank
 from runtime.arguments import PARSER
+from runtime.listnet import sample_group, group_key
 from data_loading.pdb2dict import Target, Model
 import dgl
+import math
 import sys
 import io
 import pickle,torch,random,os,glob,time
@@ -183,6 +185,7 @@ def graph_build_param_dict(spec, gb):
                        {k: list(v) for k, v in dict(cr).items()}) if not isinstance(cr, (list, tuple))
                       else [list(x) for x in cr],
         'task_scope': str(getattr(spec, 'task_scope', 'full_cdr')),
+        'atom_graph': bool(getattr(gb, 'atom_graph', False)),
     }
 
 # ── Lazy imports for YAML-driven pipeline (avoid import errors when not used) ──
@@ -331,6 +334,7 @@ class MyDataset(Dataset):
         # weights so the eval pool is identical across phase/epoch/head.
         self._manifest_keys = None
         self._manifest_meta = None
+        self._listnet_scan = False
         # ── graph cache (Layer-B indexed containers; see libs/data_loading/graph_pack.py)
         # Mode/dir come from env (set by train.py from --graph_cache_mode/-dir) or
         # the YAML spec.graph_cache; default off. In 'read' mode a valid pack for a
@@ -843,6 +847,7 @@ class MyDataset(Dataset):
                     cdr_context_cutoff=gb.cdr_context_cutoff,
                     max_context_residues=gb.max_context_residues,
                     graph_crop_debug=gb.graph_crop_debug,
+                    atom_graph=getattr(gb, 'atom_graph', False),
                 )
                 if gp is None:
                     continue
@@ -1038,6 +1043,12 @@ class MyDataset(Dataset):
         # decoys from the manifest, bypassing tier sampler / gate / source weights.
         manifest_mode = (self._manifest_keys is not None) and (not inference_yaml)
         manifest_target = self._manifest_keys.get(str(pdb_id)) if manifest_mode else None
+        _listnet_mode = (getattr(spec, "sampler_mode", None) == "listnet")
+        _listnet_train = _listnet_mode and (not manifest_mode) and (not inference_yaml)
+        _carry_ids = _listnet_mode and (not inference_yaml)
+        _scan_counts = {}
+        _scan_q = {}
+        _scan_fnat = {}
 
         # Graph cache is usable unless this run needs on-the-fly H3 lDDT labels
         # (finetune + ord-aux), which require the structure (compute_q) and so
@@ -1205,7 +1216,7 @@ class MyDataset(Dataset):
                         ag_local_full = [_ag_local_from_model(m) for m in target_obj.models]
                         # Identity keys (seed, sample) aligned to model index — used
                         # for manifest selection; same identities the store is keyed by.
-                        if manifest_mode:
+                        if manifest_mode or _carry_ids:
                             from dataset.precomputed_metrics import decoy_identity_for_lookup
                             _cand_keys = []
                             for _pos, _m in enumerate(target_obj.models):
@@ -1294,7 +1305,7 @@ class MyDataset(Dataset):
 
             # Default identity keys for non-on-the-fly sources (graph_pickle):
             # seed=None, sample=flat index (matches GP precompute convention).
-            if manifest_mode and sname not in per_source_keys:
+            if (manifest_mode or _carry_ids) and sname not in per_source_keys:
                 per_source_keys[sname] = [(None, i) for i in range(len(all_rmsds))]
                 per_source_resolved[sname] = cand.pdb_id
 
@@ -1312,6 +1323,8 @@ class MyDataset(Dataset):
                         "_getitem_yaml: %s/%s dropped %d/%d decoys without precomputed metric",
                         sname, pdb_id, n_dropped, n_before,
                     )
+            if _listnet_train:
+                valid_indices = [i for i in valid_indices if math.isfinite(all_rmsds[i])]
 
             # Training/validation: RMSD range filter.
             # Inference: keep all decoys (filters are for offline analysis only).
@@ -1383,6 +1396,26 @@ class MyDataset(Dataset):
                             sname, pdb_id, float(_fgate), _nb - len(valid_indices), _nb,
                         )
 
+            if _carry_ids:
+                _ids = per_source_keys.get(sname)
+                if _ids is None or len(_ids) != len(all_rmsds):
+                    raise ValueError(
+                        f"listnet: candidate ids missing for {sname}/{pdb_id} "
+                        f"({0 if _ids is None else len(_ids)} ids vs {len(all_rmsds)} labels)")
+                eval_metrics_full = dict(eval_metrics_full)
+                eval_metrics_full["cand_seed"] = [-1.0 if k[0] is None else float(k[0]) for k in _ids]
+                eval_metrics_full["cand_sample"] = [float(k[1]) for k in _ids]
+            if _listnet_train:
+                _scan_counts[sname] = [
+                    len(all_rmsds),
+                    sum(1 for v in all_rmsds if not math.isfinite(v)),
+                    len(valid_indices),
+                ]
+                _scan_q[sname] = [float(all_rmsds[i]) for i in valid_indices]
+                _fn = (eval_metrics_full or {}).get("fnat", [])
+                _scan_fnat[sname] = sum(
+                    1 for i in valid_indices if i < len(_fn) and math.isfinite(float(_fn[i])))
+
             if valid_indices or manifest_mode:
                 per_source[sname] = (
                     graph_path,
@@ -1392,6 +1425,10 @@ class MyDataset(Dataset):
                     ag_local_full,
                     eval_metrics_full,
                 )
+
+        if self._listnet_scan:
+            return {"target": str(pdb_id), "sources": _scan_counts, "q": _scan_q,
+                    "n_fnat_finite": _scan_fnat}
 
         if not per_source:
             if self._metric_store is not None:
@@ -1405,7 +1442,7 @@ class MyDataset(Dataset):
             # In training/validation, skip this target and try another one rather
             # than crashing the whole run (targets missing from the precomputed
             # parquet, etc.). Bounded retry guards against infinite recursion.
-            if not inference_yaml and len(self.inp_dat) > 1 and _depth < 50:
+            if not inference_yaml and not _listnet_train and len(self.inp_dat) > 1 and _depth < 50:
                 _logging.warning(
                     "_getitem_yaml: %s -> %s; skipping to another target (retry %d)",
                     pdb_id, reason, _depth + 1,
@@ -1734,6 +1771,12 @@ class MyDataset(Dataset):
                     for j in _spread(top, k_top) + _spread(rest, k_rest):
                         selected_ii.add(j)
                 tier_to_ii = {"X": []}
+            elif _listnet_mode:
+                _cap = int(getattr(args, "listnet_max_candidates", 0) or 0) or int(n_decoy_target)
+                selected_ii = set(sample_group(
+                    [j for j in range(len(pool)) if j not in topup_only_ii], _cap,
+                    group_key(spec.seed, getattr(args, "seed", 0), epoch, pdb_id)))
+                tier_to_ii = {"X": []}
             elif _bins:
                 # ── configurable bins (e.g. fvctx_sml) ──
                 # Step 1 crystal (by source, prob-gated), Step 2 per-bin quota
@@ -2035,6 +2078,9 @@ class MyDataset(Dataset):
         merged_ag_local = [] if inference_yaml else None
         merged_decoy_meta = [] if inference_yaml else None
         merged_eval_metrics = {"loop_rmsd": [], "loop_lddt": [], "h3_lddt": [], "dockq": [], "fnat": []}
+        if _carry_ids:
+            merged_eval_metrics["cand_seed"] = []
+            merged_eval_metrics["cand_sample"] = []
         # v2: per-decoy source type {0=holo, 1=apo, 2=gp}. GP is decided by the
         # source's `domain` field; antibody sources are apo vs holo by finite DockQ.
         merged_source_type = []
@@ -2165,6 +2211,7 @@ class MyDataset(Dataset):
                                 graph_crop_debug=gb.graph_crop_debug,
                                 target_id=pdb_id,
                                 profile_timings=data_profile if profile_data_loading else None,
+                                atom_graph=getattr(gb, 'atom_graph', False),
                             )
                             dist_cutoff = gb.dist_cutoff_center
                             # Manifest (fixed-eval) mode keeps the cutoff deterministic
@@ -2246,6 +2293,11 @@ class MyDataset(Dataset):
 
         if not merged_graphs:
             raise FileNotFoundError(f"No graphs loaded for {pdb_id}")
+        if _listnet_train:
+            _n_sel = sum(len(v) for v in source_selected.values())
+            if len(merged_graphs) != _n_sel:
+                raise RuntimeError(
+                    f"listnet: {pdb_id} loaded {len(merged_graphs)} of {_n_sel} selected candidates")
 
         # total non-xtal pool size (before del) — used by priority_A (top-2% of full pool)
         total_non_xtal_pool = sum(
@@ -2266,7 +2318,7 @@ class MyDataset(Dataset):
         near_idx = [i for i in range(n_total) if _is_near_native(merged_rmsds[i])]
         non_idx  = [i for i in range(n_total) if not _is_near_native(merged_rmsds[i])]
 
-        if not near_idx or not non_idx:
+        if (not near_idx or not non_idx) and not _listnet_mode:
             min_r = min(merged_rmsds) if merged_rmsds else float('nan')
             max_r = max(merged_rmsds) if merged_rmsds else float('nan')
             cnt = len(merged_rmsds)
@@ -2277,7 +2329,7 @@ class MyDataset(Dataset):
                 _logging.warning("_getitem_yaml: %s has NO non-native decoys; count=%d, label=[%.3f,%.3f]",
                                  pdb_id, cnt, min_r, max_r)
 
-        if (not inference_yaml) and (not manifest_mode) and n_total > n_decoy:
+        if (not inference_yaml) and (not manifest_mode) and (not _listnet_train) and n_total > n_decoy:
             # Trim to n_decoy, preserving class balance
             if near_idx and non_idx:
                 n_near = min(_MIN_PER_CLASS, len(near_idx), max(1, n_decoy // 2))
@@ -2315,7 +2367,7 @@ class MyDataset(Dataset):
                 "skipping this target: %s", pdb_id, e,
             )
             del merged_graphs, merged_rmsds
-            if len(self.inp_dat) > 1 and _depth < 50:
+            if not _listnet_train and len(self.inp_dat) > 1 and _depth < 50:
                 alt_idx = random.randint(0, len(self.inp_dat) - 1)
                 return self._getitem_yaml(self.inp_dat[alt_idx], _depth + 1)
             raise

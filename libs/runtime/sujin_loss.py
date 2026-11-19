@@ -1503,11 +1503,11 @@ class FinalLoss(nn.Module):
         with torch.no_grad():
             out_dic['final_loss']=final_loss
             out_dic['best_rank']=best_rank
-            out_dic['rmsd_diff']=rmsd_diff
-            out_dic['top1_rmsd']=top1_rmsd
-            out_dic['top3_rmsd']=top3_rmsd
-            out_dic['top5_rmsd']=top5_rmsd
-            out_dic['top10_rmsd']=top10_rmsd
+            out_dic['metric_diff']=rmsd_diff
+            out_dic['top1_metric']=top1_rmsd
+            out_dic['top3_metric']=top3_rmsd
+            out_dic['top5_metric']=top5_rmsd
+            out_dic['top10_metric']=top10_rmsd
             # exp6b/exp6all: emit the 2-D tier counts on EVERY step (zeros when the
             # tier path is off) so all DDP ranks share the keyset.
             for _k in ('sml_n_T1', 'sml_n_T3', 'sml_n_skipped', 'sml_tier_fallback',
@@ -1619,11 +1619,11 @@ class PreferenceLoss:
         with torch.no_grad():
             out_dic['final_loss'] = loss
             out_dic['best_rank'] = best_rank
-            out_dic['rmsd_diff'] = diff_rmsd
-            out_dic['top1_rmsd'] = topn_rmsd['top1_rmsd']
-            out_dic['top3_rmsd'] = topn_rmsd['top3_rmsd']
-            out_dic['top5_rmsd'] = topn_rmsd['top5_rmsd']
-            out_dic['top10_rmsd'] = topn_rmsd['top10_rmsd']
+            out_dic['metric_diff'] = diff_rmsd
+            out_dic['top1_metric'] = topn_rmsd['top1_rmsd']
+            out_dic['top3_metric'] = topn_rmsd['top3_rmsd']
+            out_dic['top5_metric'] = topn_rmsd['top5_rmsd']
+            out_dic['top10_metric'] = topn_rmsd['top10_rmsd']
 
         return loss, out_dic
 
@@ -1644,11 +1644,11 @@ class RankingLoss:
         with torch.no_grad():
             out_dic['final_loss'] = loss
             out_dic['best_rank'] = best_rank
-            out_dic['rmsd_diff'] = diff_rmsd
-            out_dic['top1_rmsd'] = topn_rmsd['top1_rmsd']
-            out_dic['top3_rmsd'] = topn_rmsd['top3_rmsd']
-            out_dic['top5_rmsd'] = topn_rmsd['top5_rmsd']
-            out_dic['top10_rmsd'] = topn_rmsd['top10_rmsd']
+            out_dic['metric_diff'] = diff_rmsd
+            out_dic['top1_metric'] = topn_rmsd['top1_rmsd']
+            out_dic['top3_metric'] = topn_rmsd['top3_rmsd']
+            out_dic['top5_metric'] = topn_rmsd['top5_rmsd']
+            out_dic['top10_metric'] = topn_rmsd['top10_rmsd']
             
         return loss, out_dic
 
@@ -1679,11 +1679,11 @@ class TripletLoss:
         with torch.no_grad():
             out_dic['final_loss'] = loss
             out_dic['best_rank'] = best_rank
-            out_dic['rmsd_diff'] = diff_rmsd
-            out_dic['top1_rmsd'] = topn_rmsd['top1_rmsd']
-            out_dic['top3_rmsd'] = topn_rmsd['top3_rmsd']
-            out_dic['top5_rmsd'] = topn_rmsd['top5_rmsd']
-            out_dic['top10_rmsd'] = topn_rmsd['top10_rmsd']
+            out_dic['metric_diff'] = diff_rmsd
+            out_dic['top1_metric'] = topn_rmsd['top1_rmsd']
+            out_dic['top3_metric'] = topn_rmsd['top3_rmsd']
+            out_dic['top5_metric'] = topn_rmsd['top5_rmsd']
+            out_dic['top10_metric'] = topn_rmsd['top10_rmsd']
             
         return loss, out_dic
 
@@ -1813,11 +1813,11 @@ class DPOLoss:
         with torch.no_grad():
             out_dic['final_loss'] = loss
             out_dic['best_rank'] = best_rank
-            out_dic['rmsd_diff'] = diff_rmsd
-            out_dic['top1_rmsd'] = topn_rmsd['top1_rmsd']
-            out_dic['top3_rmsd'] = topn_rmsd['top3_rmsd']
-            out_dic['top5_rmsd'] = topn_rmsd['top5_rmsd']
-            out_dic['top10_rmsd'] = topn_rmsd['top10_rmsd']
+            out_dic['metric_diff'] = diff_rmsd
+            out_dic['top1_metric'] = topn_rmsd['top1_rmsd']
+            out_dic['top3_metric'] = topn_rmsd['top3_rmsd']
+            out_dic['top5_metric'] = topn_rmsd['top5_rmsd']
+            out_dic['top10_metric'] = topn_rmsd['top10_rmsd']
         return loss, out_dic
 
 class TotalLoss:
@@ -1857,11 +1857,11 @@ class TotalLoss:
             out_dic['loss_sml'] = loss_sml.detach()
             out_dic['loss_dpo_base'] = loss_dpo.detach()
             out_dic['best_rank'] = best_rank
-            out_dic['rmsd_diff'] = rmsd_diff
-            out_dic['top1_rmsd'] = top1_rmsd
-            out_dic['top3_rmsd'] = top3_rmsd
-            out_dic['top5_rmsd'] = top5_rmsd
-            out_dic['top10_rmsd'] = top10_rmsd
+            out_dic['metric_diff'] = rmsd_diff
+            out_dic['top1_metric'] = top1_rmsd
+            out_dic['top3_metric'] = top3_rmsd
+            out_dic['top5_metric'] = top5_rmsd
+            out_dic['top10_metric'] = top10_rmsd
             for _k in ('sml_n_T1', 'sml_n_T3', 'sml_n_skipped', 'sml_tier_fallback',
                        'sml_n_fnat_gated', 'sml_n_demote_dropped'):
                 out_dic[_k] = float(_stats.get(_k, 0.0))
@@ -1952,11 +1952,11 @@ class nDPOLoss:
         with torch.no_grad():
             out_dic['final_loss'] = loss
             out_dic['best_rank'] = best_rank
-            out_dic['rmsd_diff'] = diff_rmsd
-            out_dic['top1_rmsd'] = topn_rmsd['top1_rmsd']
-            out_dic['top3_rmsd'] = topn_rmsd['top3_rmsd']
-            out_dic['top5_rmsd'] = topn_rmsd['top5_rmsd']
-            out_dic['top10_rmsd'] = topn_rmsd['top10_rmsd']
+            out_dic['metric_diff'] = diff_rmsd
+            out_dic['top1_metric'] = topn_rmsd['top1_rmsd']
+            out_dic['top3_metric'] = topn_rmsd['top3_rmsd']
+            out_dic['top5_metric'] = topn_rmsd['top5_rmsd']
+            out_dic['top10_metric'] = topn_rmsd['top10_rmsd']
         return loss, out_dic
     
 class LDPOLoss:
@@ -2115,11 +2115,11 @@ class LDPOLoss:
         with torch.no_grad():
             out_dic['final_loss'] = loss
             out_dic['best_rank'] = best_rank
-            out_dic['rmsd_diff'] = diff_rmsd
-            out_dic['top1_rmsd'] = topn_rmsd['top1_rmsd']
-            out_dic['top3_rmsd'] = topn_rmsd['top3_rmsd']
-            out_dic['top5_rmsd'] = topn_rmsd['top5_rmsd']
-            out_dic['top10_rmsd'] = topn_rmsd['top10_rmsd']
+            out_dic['metric_diff'] = diff_rmsd
+            out_dic['top1_metric'] = topn_rmsd['top1_rmsd']
+            out_dic['top3_metric'] = topn_rmsd['top3_rmsd']
+            out_dic['top5_metric'] = topn_rmsd['top5_rmsd']
+            out_dic['top10_metric'] = topn_rmsd['top10_rmsd']
             
         return loss, out_dic
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build Target pickles from pertMD or Boltz2 s10n10 decoy directories.
+"""Build Target pickles from pertMD, Boltz2 s10n10 or Protenix decoy directories.
 
 The output pickle uses data_loading.pdb2dict.Target/Model so it can be consumed
 by the existing target_model_pickle dataset source and precompute scripts.
@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from Bio.PDB import MMCIFParser, PDBParser
+from Bio.PDB.Chain import Chain as PDBChain
+from Bio.PDB.Model import Model as PDBModel
 from Bio.PDB.Structure import Structure as PDBStructure
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -429,6 +431,12 @@ def build_boltz2_s10n10_target(args: argparse.Namespace, target_id: str) -> Targ
             compute_rmsd_metrics(target, model, args.atom_type)
         target.models.append(model)
 
+    rank_models_by_score(target)
+    return target
+
+
+def rank_models_by_score(target: Target) -> None:
+    """ranking = 1-based rank of ranking_score (higher first; ties by seed, sample)."""
     finite_scores = [
         (idx, model.ranking_score)
         for idx, model in enumerate(target.models)
@@ -438,6 +446,94 @@ def build_boltz2_s10n10_target(args: argparse.Namespace, target_id: str) -> Targ
     for rank, (idx, _score) in enumerate(finite_scores, start=1):
         target.models[idx].ranking = rank
 
+
+def protenix_prediction_dir(input_dir: Path, target_id: str, seed: int) -> Path:
+    return input_dir / target_id / target_id / f"seed_{seed}" / "predictions"
+
+
+def renumber_to_native(structure, resmap: Dict[str, List[Optional[str]]], struct_id: str) -> PDBStructure:
+    """Sequentially numbered model -> native numbering: the i-th residue of a chain takes resmap[chain][i].
+
+    resmap comes from preprocess/protenix/build_protenix_resmap.py (null = no native residue, dropped).
+    """
+    out = PDBStructure(struct_id)
+    out_model = PDBModel(0)
+    out.add(out_model)
+    for chain in next(structure.get_models()):
+        labels = resmap.get(chain.id)
+        if labels is None:
+            raise ValueError(f"{struct_id}: chain {chain.id} not in resmap {sorted(resmap)}")
+        residues = [residue for residue in chain if residue.id[0] == " "]
+        if len(residues) != len(labels):
+            raise ValueError(f"{struct_id}: chain {chain.id} has {len(residues)} residues, resmap {len(labels)}")
+        new_chain = PDBChain(chain.id)
+        for residue, label in zip(residues, labels):
+            if label is None:
+                continue
+            number, icode = re.match(r"(-?\d+)([A-Za-z]?)$", label).groups()
+            residue.detach_parent()
+            residue.id = (" ", int(number), icode or " ")
+            new_chain.add(residue)
+        out_model.add(new_chain)
+    return out
+
+
+def protenix_h3_plddt(structure) -> float:
+    """Mean residue pLDDT over Chothia H95-H102, on Boltz2's 0-1 scale.
+
+    Protenix writes per-atom pLDDT (0-100) to the B-factor column; a residue takes its atom mean.
+    """
+    model = next(structure.get_models())
+    if "H" not in model:
+        return float("nan")
+    values = [
+        np.mean([atom.get_bfactor() for atom in residue])
+        for residue in model["H"]
+        if residue.id[0] == " " and 95 <= int(residue.id[1]) <= 102
+    ]
+    return float(np.mean(values)) / 100.0 if values else float("nan")
+
+
+def build_protenix_target(args: argparse.Namespace, target_id: str) -> Target:
+    native_path = resolve_native_path(args.native_dir, target_id, args.native_template)
+    target = Target(pdb_id=target_id, pdb_path=native_path, db_dir=args.input_dir / target_id)
+    with open(args.resmap_dir / f"{target_id}.json", encoding="utf-8") as handle:
+        resmap = json.load(handle)["resmap"]
+
+    for seed in parse_range_spec(args.seeds):
+        pred_dir = protenix_prediction_dir(args.input_dir, target_id, seed)
+        for sample in parse_range_spec(args.samples):
+            cif_path = pred_dir / f"{target_id}_sample_{sample}.cif"
+            if not cif_path.is_file():
+                if args.strict:
+                    raise FileNotFoundError(f"Missing Protenix decoy structure: {cif_path}")
+                continue
+            with open(pred_dir / f"{target_id}_summary_confidence_sample_{sample}.json", encoding="utf-8") as handle:
+                summary = json.load(handle)
+            struct_id = f"{target_id}_seed_{seed}_sample_{sample}"
+            structure = renumber_to_native(parse_structure(cif_path, struct_id), resmap, struct_id)
+            # ranking_score = Protenix's own ranking (0.8 ipTM + 0.2 pTM - clash penalty), as for AF3.
+            model = Model(
+                method=args.method,
+                md_structure=structure,
+                pdb_path=cif_path,
+                ranking_score=float(summary["ranking_score"]),
+                confidence_score=float(summary["ranking_score"]),
+                iptm=float(summary["iptm"]),
+                h3_plddt=protenix_h3_plddt(structure),
+            )
+            setattr(model, "seed", seed)
+            setattr(model, "model_idx", sample)
+            setattr(model, "ptm", float(summary["ptm"]))
+            setattr(model, "plddt", float(summary["plddt"]))
+            setattr(model, "has_clash", float(summary["has_clash"]))
+            if args.compute_metrics:
+                compute_rmsd_metrics(target, model, args.atom_type)
+            target.models.append(model)
+
+    if not target.models:
+        raise FileNotFoundError(f"No Protenix structures under {args.input_dir / target_id}")
+    rank_models_by_score(target)
     return target
 
 
@@ -451,6 +547,10 @@ def discover_targets(args: argparse.Namespace) -> List[str]:
                 continue
             if args.source_type == "pertmd":
                 if (path / args.model_relative_path).is_file():
+                    target_ids.append(path.name)
+            elif args.source_type == "protenix":
+                # .done = every seed x sample structure is on disk (written by the sbatch script)
+                if (path / ".done").is_file():
                     target_ids.append(path.name)
             else:
                 if any(path.glob("seed_*/boltz_results_*/predictions/*")):
@@ -490,6 +590,9 @@ def process_one(job: Dict[str, Any]) -> Dict[str, Any]:
         elif args.source_type == "boltz2_s10n10":
             summary["input_path"] = str(args.input_dir / target_id)
             target = build_boltz2_s10n10_target(args, target_id)
+        elif args.source_type == "protenix":
+            summary["input_path"] = str(args.input_dir / target_id)
+            target = build_protenix_target(args, target_id)
         else:
             raise ValueError(f"Unknown source_type: {args.source_type}")
 
@@ -535,7 +638,7 @@ def build_parser(defaults: Optional[Dict[str, Any]] = None) -> argparse.Argument
     defaults = defaults or {}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-yaml", type=Path, default=None, help="Optional flat YAML config.")
-    parser.add_argument("--source-type", choices=("pertmd", "boltz2_s10n10"), default=defaults.get("source_type"))
+    parser.add_argument("--source-type", choices=("pertmd", "boltz2_s10n10", "protenix"), default=defaults.get("source_type"))
     parser.add_argument("--input-dir", type=Path, default=defaults.get("input_dir"))
     parser.add_argument(
         "--chothia-dir",
@@ -544,6 +647,13 @@ def build_parser(defaults: Optional[Dict[str, Any]] = None) -> argparse.Argument
         help="For boltz2_s10n10: read decoy coordinates from Chothia-renumbered PDBs "
         "({target}/{target}_seed_{seed}_sample_{sample}.pdb) instead of the raw CIFs. "
         "Confidence/plDDT are still read from --input-dir.",
+    )
+    parser.add_argument(
+        "--resmap-dir",
+        type=Path,
+        default=defaults.get("resmap_dir"),
+        help="For protenix: {target}.json residue maps (sequence index -> native label) used to "
+        "renumber each CIF in memory (preprocess/protenix/build_protenix_resmap.py).",
     )
     parser.add_argument("--output-dir", type=Path, default=defaults.get("output_dir"))
     parser.add_argument("--native-dir", type=Path, default=defaults.get("native_dir"))
@@ -586,6 +696,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     for path_field in (
         "input_dir",
         "chothia_dir",
+        "resmap_dir",
         "output_dir",
         "native_dir",
         "target_list",
@@ -600,8 +711,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     missing = [name for name in required if getattr(args, name) is None]
     if missing:
         parser.error("missing required arguments: " + ", ".join(f"--{name.replace('_', '-')}" for name in missing))
+    if args.source_type == "protenix" and args.resmap_dir is None:
+        parser.error("--resmap-dir is required for --source-type protenix")
     if args.method is None:
-        args.method = "pertmd" if args.source_type == "pertmd" else "boltz2"
+        args.method = {"pertmd": "pertmd", "protenix": "protenix"}.get(args.source_type, "boltz2")
     return args
 
 
