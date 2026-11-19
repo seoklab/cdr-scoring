@@ -32,13 +32,16 @@ config = _config_dict(
                 'final_loss'        :0.0,
                 'best_rank'       :0.0,
                 #'lddt_diff'      :0.0,
-                'rmsd_diff' :0.0,
+                # These five hold the ACTIVE --label_metric, not RMSD: lDDT when
+                # label_metric is an lDDT, RMSD when it is an RMSD. Named for the
+                # role, not the unit, so the name stays true either way. The epoch
+                # log records which metric was active in its '# label_metric=' line.
+                'metric_diff' :0.0,
                 #'pLDDT'    :0.0,
-                'top1_rmsd' :0.0,
-                'top3_rmsd' :0.0,
-                'top5_rmsd' :0.0,
-                'top10_rmsd':0.0,
-                # 'topn_rmsd':{'top1_rmsd':0.0,'top3_rmsd':0.0,'top5_rmsd':0.0,'top10_rmsd':0.0},
+                'top1_metric' :0.0,
+                'top3_metric' :0.0,
+                'top5_metric' :0.0,
+                'top10_metric':0.0,
                       }
                 }
     }

@@ -378,6 +378,24 @@ PARSER.add_argument('--manifest_val_interval', type=int, default=1,
                     help='Run the fixed-manifest validation every N epochs (it rebuilds '
                          'graphs on the fly, so it is expensive). 0/1 = every epoch.')
 
+PARSER.add_argument('--listnet_tau_q', type=float, default=0.01,
+                    help='--loss_type listnet: temperature of the label softmax.')
+PARSER.add_argument('--listnet_tau_s', type=float, default=1.0,
+                    help='--loss_type listnet: temperature of the score softmax.')
+PARSER.add_argument('--listnet_max_candidates', type=int, default=64,
+                    help='--loss_type listnet: max same-target candidates per group.')
+PARSER.add_argument('--listnet_teacher', type=str, default='fixed', choices=['fixed', 'adaptive_std'],
+                    help='--loss_type listnet: label softmax temperature, fixed --listnet_tau_q or per target '
+                         'max(population SD of the target q, --listnet_tau_q_floor).')
+PARSER.add_argument('--listnet_tau_q_floor', type=float, default=0.005,
+                    help='--loss_type listnet, --listnet_teacher adaptive_std: lower bound of the per-target tau_q.')
+PARSER.add_argument('--listnet_train_subset', type=str, default='all', choices=['all', 'holo', 'apo'],
+                    help='--loss_type listnet: train on every valid target group, or only the holo '
+                         '(antigen-bearing, existing fnat gate applied) or only the apo groups. '
+                         'Validation is unchanged.')
+PARSER.add_argument('--listnet_smoke_targets', type=int, default=0,
+                    help='--loss_type listnet: train on the first N valid targets only (0 = all).')
+
 # ── graph cache (Layer-B indexed containers; preprocess/build_graph_cache.py) ──
 PARSER.add_argument('--graph_cache_mode', type=str, default='off', choices=['off', 'read'],
                     help="'read': serve decoy graphs from a prebuilt cache generation "
